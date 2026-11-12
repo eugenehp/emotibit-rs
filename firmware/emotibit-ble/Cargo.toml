@@ -1,0 +1,80 @@
+[package]
+edition      = "2024"
+name         = "emotibit-ble"
+rust-version = "1.95"
+version      = "0.1.0"
+
+[[bin]]
+name = "emotibit-ble"
+path = "./src/bin/main.rs"
+
+[dependencies]
+esp-hal = { version = "~1.2.2", features = ["esp32", "log-04", "unstable"] }
+
+esp-rtos = { version = "0.4.0", features = [
+  "embassy",
+  "esp-alloc",
+  "esp-radio",
+  "esp32",
+  "log-04",
+] }
+
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32", "log-04"] }
+log                    = "0.4.27"
+
+bt-hci = "0.9.0"
+embassy-executor = { version = "0.10.0", features = ["log"] }
+embassy-futures = "0.1"
+embassy-time = { version = "0.5.0", features = ["log"] }
+embedded-io = "0.7.1"
+embedded-io-async = "0.7.0"
+esp-alloc = { version = "0.11.0", features = ["esp32"] }
+esp-backtrace = { version = "0.20.0", features = [
+  "esp32",
+  "panic-handler",
+  "println",
+] }
+esp-println = { version = "0.18.0", features = ["esp32", "log-04"] }
+esp-radio = { version = "1.0.0-beta.1", features = [
+  "ble",
+  "esp-alloc",
+  "esp32",
+  "log-04",
+  "unstable",
+] }
+trouble-host = { version = "0.7.0", features = ["gatt", "default-packet-pool-mtu-512"] }
+
+critical-section = "1.2.0"
+static_cell      = "2.1.1"
+embassy-sync = "0.8.0"
+embedded-hal-async = "1.0.0"
+libm = "0.2.16"
+nb = "1.1.0"
+heapless = "0.9.3"
+embedded-hal = "1.0.0"
+esp-storage = { version = "0.10.0", features = ["esp32", "embedded-storage"] }
+embedded-storage = "0.3.1"
+embedded-hal-bus = "0.3.0"
+embedded-sdmmc = { version = "0.10.0", default-features = false, features = ["log"] }
+
+
+# For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
+[profile.dev]
+# The default debug profile is too slow and too big for resource-constrained devices.
+# Always build with some optimizations enabled.
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1     # LLVM can perform better optimizations using a single thread
+debug         = 2     # prefer slower builds but better debugging experience
+lto           = 'fat'
+opt-level     = 's'
+
+# esp-hal 1.2.2 with one fix: read the ESP32 I2C RX FIFO the way ESP-IDF does
+# (`vendor/esp-hal/src/i2c/master/low_level/v1.rs`, `read_fifo`). Without it, an interrupt during
+# the read occasionally drops a byte and corrupts a sensor sample.
+[patch.crates-io]
+esp-hal = { path = "vendor/esp-hal" }
+# embedded-sdmmc 0.10.0 with one fix: accept a CSD register whose own CRC7 is zero (some cards
+# ship that way; `vendor/embedded-sdmmc/src/sdcard/spi.rs`, `read_csd`).
+embedded-sdmmc = { path = "vendor/embedded-sdmmc" }

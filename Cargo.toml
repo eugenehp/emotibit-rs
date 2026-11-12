@@ -1,0 +1,139 @@
+[package]
+name         = "emotibit"
+version      = "0.1.0"
+edition      = "2024"
+# webbluetooth needs it (as in muse-rs); declared rather than found halfway through a build.
+rust-version = "1.94"
+description  = "EmotiBit over WiFi (stock firmware) or Bluetooth (the emotibit-ble firmware): CLI, TUI and browser oscilloscopes, SD card, recorder/parser, LSL/OSC/UDP outputs, and a firmware flasher"
+readme       = "README.md"
+keywords     = ["emotibit", "eda", "ppg", "imu", "biosignals"]
+categories   = ["science", "hardware-support", "wasm"]
+authors      = ["Eugene Hauptmann"]
+license      = "Apache-2.0"
+homepage     = "https://github.com/eugenehp/emotibit-rs"
+repository   = "https://github.com/eugenehp/emotibit-rs"
+documentation = "https://docs.rs/emotibit"
+# The firmware's sources and vendored crates build with their own toolchain; the package carries
+# its image (firmware/emotibit-ble.bin), which the flasher embeds.
+exclude      = ["/firmware/emotibit-ble/target/", "/firmware/emotibit-ble/vendor/", "/.emotibit/", "/dist/", "/release/", "/web/pkg/", "/examples/web/dist/", "/.github/"]
+
+# ── Library target ────────────────────────────────────────────────────────────
+# `cdylib` is for the browser build (wasm-pack); `rlib` is what Rust crates link.
+# The portable core (protocol, parsing, status, health, periodizer, time sync,
+# scope buffers) builds for wasm32; networking, files and outputs are native-only.
+
+[lib]
+name = "emotibit"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+# ── Binary targets ────────────────────────────────────────────────────────────
+
+# Headless CLI: scan, info, stream, record, parse, serve, tui.
+[[bin]]
+name = "emotibit"
+path = "src/main.rs"
+# Same name as the library: document only the library (cargo doc would overwrite one with the other).
+doc  = false
+
+# The firmware commands of `emotibit firmware` on their own — requires the `flash` feature.
+[[bin]]
+name = "emotibit-flash"
+path = "src/bin/flash.rs"
+required-features = ["flash"]
+
+# Browser version (examples/web): a `cdylib`, because what a page loads is a `.wasm`.
+# `examples/web/build.sh` builds it and lays out the directory to serve.
+# Diagnostics, each with the feature it needs (see the examples' own docs).
+[[example]]
+name              = "serial_probe"
+required-features = ["serial"]
+
+[[example]]
+name              = "serial_diag"
+required-features = ["serial"]
+
+[[example]]
+name              = "lsl_probe"
+required-features = ["lsl"]
+
+[[example]]
+name              = "lsl_marker_send"
+required-features = ["lsl"]
+
+[[example]]
+name              = "web"
+path              = "examples/web/lib.rs"
+crate-type        = ["cdylib"]
+required-features = ["ble"]
+
+# ── Features ──────────────────────────────────────────────────────────────────
+#
+# serial — USB-serial debug streaming (`emotibit serial`), via serialport.
+# flash — firmware over USB (`emotibit firmware`, `emotibit-flash`): info, backup, restore,
+#         stock, emotibit-ble (built in), any image. espflash/indicatif; includes serial.
+# tui   — ratatui/crossterm for the terminal oscilloscope.
+# lsl   — Lab Streaming Layer in/out via the pure-Rust `rlsl` crate.
+# osc   — OSC output via `rosc`.
+# ws    — WebSocket bridge for the browser UI.
+# ble   — BLE client for the custom `emotibit-ble` firmware, via `webbluetooth` (CoreBluetooth,
+#         BlueZ or WinRT natively; the browser's Web Bluetooth on wasm32, see examples/web).
+# webscope — the wasm-bindgen `WebScope` for the bridge page in web/ (scripts/build-web.sh).
+#
+# Library-only consumers can opt out of everything:
+#
+#   emotibit = { version = "...", default-features = false }
+
+[features]
+default = ["flash", "tui", "lsl", "osc", "ws", "ble"]
+serial  = ["dep:serialport"]
+ble     = ["dep:webbluetooth", "dep:uuid", "dep:futures-util", "dep:webbluetooth-wasm"]
+webscope = ["dep:wasm-bindgen"]
+flash   = ["serial", "dep:espflash", "dep:indicatif"]
+tui     = ["dep:ratatui", "dep:crossterm"]
+lsl     = ["dep:rlsl"]
+osc     = ["dep:rosc"]
+ws      = ["dep:tokio-tungstenite", "dep:futures-util"]
+
+# ── Portable dependencies (native + wasm32) ───────────────────────────────────
+
+[dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+libm       = "0.2"
+anyhow     = "1"
+log        = "0.4"
+# Channels only: they need no runtime, so they work on the page's event loop too.
+tokio      = { version = "1", default-features = false, features = ["sync", "macros"] }
+uuid              = { version = "1", optional = true }
+futures-util      = { version = "0.3", optional = true }
+# Held at the version webbluetooth-wasm pairs with (as muse-rs does).
+webbluetooth      = { version = "0.0.4", features = ["uuid"], optional = true }
+
+# ── Native-only dependencies ──────────────────────────────────────────────────
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+chrono     = { version = "0.4", default-features = false, features = ["clock"] }
+clap       = { version = "4", features = ["derive", "env"] }
+env_logger = "0.11"
+if-addrs   = "0.15"
+tokio      = { version = "1", features = ["net", "time", "sync", "io-util", "signal", "fs", "rt-multi-thread", "macros"] }
+
+espflash   = { version = "4.7", default-features = false, features = ["serialport"], optional = true }
+indicatif  = { version = "0.18", optional = true }
+serialport = { version = "4.10", optional = true }
+
+ratatui    = { version = "0.30", features = ["crossterm"], optional = true }
+crossterm  = { version = "0.29", optional = true }
+
+rlsl       = { version = "0.0.6", optional = true }
+rosc       = { version = "0.11", optional = true }
+
+tokio-tungstenite = { version = "0.26", optional = true }
+
+# ── Browser-only dependencies ─────────────────────────────────────────────────
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { version = "0.2", optional = true }
+# The executor and setTimeout `platform` uses in a page; the same 0.0.4 webbluetooth pairs with.
+webbluetooth-wasm = { version = "0.0.4", optional = true }

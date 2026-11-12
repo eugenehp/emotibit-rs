@@ -1,0 +1,80 @@
+# On a version tag (v0.1.0): build the release archives on each OS and attach them to a GitHub
+# release. Each archive embeds firmware/emotibit-ble.bin as committed; rebuild it locally with
+# scripts/ble-firmware.sh before tagging when the firmware changed.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,${{ matrix.target }}
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libudev-dev pkg-config
+      # The build scripts run python3 (or python): a real one, not Windows' Store alias.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the archives
+        shell: bash
+        run: scripts/release.sh --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            release/emotibit-[0-9]*.tar.gz
+            release/emotibit-[0-9]*.zip
+            release/SHA256SUMS-${{ matrix.target }}
+      # The web page is the same everywhere: published once.
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: release-web
+          path: |
+            release/emotibit-web-ble-*.zip
+            release/SHA256SUMS-web
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Checksums
+        run: cd release && cat SHA256SUMS-* > SHA256SUMS && rm SHA256SUMS-*
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

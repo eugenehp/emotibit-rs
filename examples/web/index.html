@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>EmotiBit (emotibit, Web Bluetooth)</title>
+<style>
+  :root {
+    --bg:#f6f7f9; --card:#fff; --fg:#14171c; --muted:#6b7280; --line:#e4e7eb;
+    --accent:#2f6fde; --warn:#d33a3a; --ok:#1c9a55; --amber:#d8890b; --rec:#e5484d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1115; --card:#171a20; --fg:#e7e9ee; --muted:#8b93a1; --line:#262a33; --accent:#5b8ff0; }
+  }
+  * { box-sizing:border-box; }
+  html, body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; display:flex; flex-direction:column; }
+  .num, .mono { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric:tabular-nums; }
+  .muted { color:var(--muted); }
+  [hidden] { display:none !important; }
+  header, .bar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; padding:8px 14px; background:var(--card); border-bottom:1px solid var(--line); }
+  .brand { font-weight:700; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--muted); display:inline-block; }
+  .dot.live { background:var(--ok); } .dot.wait { background:var(--amber); }
+  #device { font-weight:600; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin-left:auto; }
+  .chip { display:inline-flex; gap:5px; align-items:baseline; padding:2px 9px; border-radius:7px; background:var(--bg); border:1px solid var(--line); white-space:nowrap; }
+  .chip .k { color:var(--muted); font-size:11px; }
+  .chip.bad { border-color:var(--warn); color:var(--warn); }
+  .chip.rec { border-color:var(--rec); color:var(--rec); }
+  button, select, input { font:inherit; color:var(--fg); background:var(--card); border:1px solid var(--line); border-radius:7px; padding:4px 10px; }
+  button { cursor:pointer; } button:disabled { opacity:.45; cursor:not-allowed; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  button.on { background:var(--rec); border-color:var(--rec); color:#fff; }
+  .group { display:inline-flex; align-items:center; gap:6px; }
+  .spacer { flex:1; }
+  #note { width:200px; }
+  .panel { padding:10px 14px; background:var(--card); border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center; }
+  .panel h3 { margin:0; font-size:13px; flex-basis:100%; }
+  .panel table { border-collapse:collapse; } .panel td { padding:2px 12px 2px 0; }
+  .pass { color:var(--ok); } .fail { color:var(--warn); }
+  #set-name { width:9ch; }
+  #files td button { padding:1px 8px; }
+  #files td.actions { white-space:nowrap; }
+  button.danger:not(:disabled):hover { border-color:var(--warn); color:var(--warn); }
+  #files .scroll { max-height:260px; overflow:auto; }
+  #files details { flex-basis:100%; }
+  table.sessions th { text-align:left; font-weight:600; color:var(--muted); padding:2px 12px 4px 0; position:sticky; top:0; background:var(--card); }
+  table.sessions td.n { text-align:right; font-variant-numeric:tabular-nums; }
+  .state-recording { color:var(--rec); } .state-interrupted { color:var(--amber); }
+  #banner { padding:6px 14px; background:color-mix(in srgb, var(--accent) 10%, var(--card)); border-bottom:1px solid var(--line); }
+  #traces { flex:1; width:100%; min-height:300px; display:block; }
+  #intro { padding:24px 14px; max-width:760px; }
+  footer { padding:4px 14px 8px; color:var(--muted); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">EmotiBit</span>
+  <span class="group"><span id="dot" class="dot"></span><span id="device">not connected</span></span>
+  <select id="format" title="Wire format"><option value="1">compact</option><option value="0">raw</option></select>
+  <button id="connect" class="primary" disabled>Connect a board…</button>
+  <button id="disconnect" hidden>Disconnect</button>
+  <span id="status" class="muted">Loading…</span>
+  <div class="chips">
+    <span class="chip"><span class="k">battery</span><b id="battery" class="num">–</b></span>
+    <span class="chip"><span class="k">rate</span><b id="rate" class="num">–</b></span>
+    <span class="chip" id="lost-chip"><span class="k">lost</span><b id="lost" class="num">0</b></span>
+    <span class="chip" id="link-chip" hidden><span class="k">link</span><b id="link" class="num"></b></span>
+    <span class="chip" id="clip-chip" hidden title="Clipping / overflow events (DC / DO)"><span class="k">clip/over</span><b id="clip" class="num">0/0</b></span>
+    <span class="chip rec" id="rec-chip" hidden><b id="rec-text">SD</b></span>
+  </div>
+</header>
+<div class="bar" id="toolbar" hidden>
+  <span class="group">
+    <button id="record">● Record on SD</button>
+    <label class="group" title="Binary files are about 3x smaller; emotibit parse reads them"><input id="binary" type="checkbox"> binary</label>
+  </span>
+  <span class="group"><input id="note" type="text" placeholder="Note for the recording"><button id="note-btn">Add note</button></span>
+  <label class="group">Power <select id="power">
+    <option value="MN">normal</option><option value="ML">low</option><option value="MM">max-low</option>
+    <option value="MO">wireless off</option><option value="MH">hibernate</option></select></label>
+  <span class="group"><span class="muted">Window</span><button id="win-">−</button><b id="win" class="num">10 s</b><button id="win+">+</button><button id="pause">Pause</button></span>
+  <label class="group"><input id="grouped" type="checkbox" checked> group axes</label>
+  <span class="spacer"></span>
+  <button id="settings-btn">Settings…</button>
+  <button id="selftest-btn">Self-test</button>
+  <button id="files-btn">SD files…</button>
+</div>
+<div class="panel" id="settings" hidden>
+  <h3>Board settings</h3>
+  <label class="group">Name <span class="muted mono">EmotiBit-BLE-</span><input id="set-name" type="text" maxlength="9" class="mono" placeholder="serial"></label>
+  <label class="group">PPG <select id="set-ppg"><option value="25">25 Hz</option><option value="100">100 Hz</option></select></label>
+  <label class="group"><input id="set-leds" type="checkbox"> status LEDs</label>
+  <label class="group">Keep in <select id="set-store"><option value="flash">flash</option><option value="sd">SD card</option><option value="both">both</option></select></label>
+  <button id="set-save">Save</button><button id="set-restart">Save &amp; restart</button>
+  <span id="set-info" class="muted"></span>
+</div>
+<div class="panel" id="selftest" hidden><h3>Self-test</h3><table id="selftest-table"></table></div>
+<div class="panel" id="files" hidden>
+  <h3>Recordings on the SD card</h3>
+  <div class="scroll"><table id="sessions-table" class="sessions"></table></div>
+  <span id="files-info" class="muted"></span>
+  <details id="other-files"><summary class="muted">Other files on the card</summary><div class="scroll"><table id="files-table"></table></div></details>
+</div>
+<div id="banner" hidden></div>
+<div id="intro" class="muted">
+  <p>The <span class="mono">emotibit</span> library compiled to WebAssembly, talking to a board running
+  <span class="mono">firmware/emotibit-ble</span> over this browser's Web Bluetooth: decoding, unit conversion,
+  heart rate, clock sync and the SD card protocol are the same Rust code the command line runs.</p>
+  <p>Chrome or Edge, over <span class="mono">localhost</span> or HTTPS. Press <b>Connect a board…</b> and pick it.</p>
+</div>
+<canvas id="traces" hidden></canvas>
+<footer><span id="foot"></span> · <span class="mono">←/→</span> window, <span class="mono">Space</span> pause</footer>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

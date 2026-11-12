@@ -1,0 +1,64 @@
+# Host library, CLI and both web pages on every push; the firmware too.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - name: Linux packages (BlueZ over D-Bus, udev for serial ports)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libudev-dev pkg-config
+      # The build scripts run python3 (or python): a real one, not Windows' Store alias.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: Docs
+        if: runner.os == 'Linux'
+        run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Library without the native extras
+        run: cargo build --locked --lib --no-default-features
+      - name: Web Bluetooth page (wasm32)
+        shell: bash
+        run: examples/web/build.sh
+
+  firmware:
+    runs-on: ubuntu-24.04
+    env:
+      # rust-toolchain.toml names the local toolchain `esp195`; the action installs it as `esp`.
+      RUSTUP_TOOLCHAIN: esp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: esp-rs/xtensa-toolchain@v1.6
+        with:
+          default: true
+          buildtargets: esp32
+          ldproxy: false
+          version: 1.97.0.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: firmware/emotibit-ble
+      - name: Build
+        working-directory: firmware/emotibit-ble
+        run: cargo build --release --locked

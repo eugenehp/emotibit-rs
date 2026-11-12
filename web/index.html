@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>EmotiBit Oscilloscope (emotibit)</title>
+<style>
+  :root {
+    --bg:#f6f7f9; --card:#fff; --fg:#14171c; --muted:#6b7280; --line:#e4e7eb; --grid:#eceef1;
+    --accent:#2f6fde; --accent-fg:#fff; --warn:#d33a3a; --ok:#1c9a55; --amber:#d8890b; --rec:#e5484d;
+    --shadow:0 1px 2px rgba(0,0,0,.05), 0 1px 8px rgba(0,0,0,.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1115; --card:#171a20; --fg:#e7e9ee; --muted:#8b93a1; --line:#262a33; --grid:#20242c; --accent:#5b8ff0; --shadow:none; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .mono, .num { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .num { font-variant-numeric:tabular-nums; }
+  .muted { color:var(--muted); }
+  [hidden] { display:none !important; }
+
+  /* Top bar */
+  header { position:sticky; top:0; z-index:5; background:var(--card); border-bottom:1px solid var(--line);
+           display:flex; flex-wrap:wrap; align-items:center; gap:8px 14px; padding:8px 14px; }
+  .brand { font-weight:700; letter-spacing:.2px; }
+  .who { display:flex; align-items:center; gap:8px; min-width:0; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--muted); flex:none; }
+  .dot.live { background:var(--ok); box-shadow:0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+  .dot.wait { background:var(--amber); animation:pulse 1s infinite alternate; }
+  .dot.bad { background:var(--warn); }
+  @keyframes pulse { to { opacity:.35; } }
+  .badge { font-size:11px; padding:1px 7px; border-radius:9px; border:1px solid var(--line); color:var(--muted); white-space:nowrap; }
+  #device { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:32ch; }
+  .stats { display:flex; flex-wrap:wrap; gap:6px; margin-left:auto; align-items:center; }
+  .chip { display:inline-flex; gap:5px; align-items:baseline; padding:2px 9px; border-radius:7px; background:var(--bg); border:1px solid var(--line); white-space:nowrap; }
+  .chip .k { color:var(--muted); font-size:11px; }
+  .chip.bad { border-color:var(--warn); color:var(--warn); }
+  .chip.rec { border-color:var(--rec); color:var(--rec); }
+  .chip.rec::before { content:""; width:7px; height:7px; border-radius:50%; background:var(--rec); align-self:center; animation:pulse .8s infinite alternate; }
+
+  button, select, input { font:inherit; color:var(--fg); background:var(--card); border:1px solid var(--line); border-radius:7px; padding:4px 10px; }
+  button { cursor:pointer; }
+  button:hover:not(:disabled) { border-color:var(--muted); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:var(--accent-fg); font-weight:600; }
+  button.primary:hover:not(:disabled) { filter:brightness(1.08); }
+  button.danger { color:var(--rec); }
+  button.recording { background:var(--rec); border-color:var(--rec); color:#fff; }
+
+  #banner { display:none; margin:10px 14px 0; padding:8px 12px; border-radius:8px; background:color-mix(in srgb, var(--warn) 12%, var(--card)); border:1px solid color-mix(in srgb, var(--warn) 45%, transparent); }
+  #banner.info { background:color-mix(in srgb, var(--accent) 10%, var(--card)); border-color:color-mix(in srgb, var(--accent) 40%, transparent); }
+
+  /* Start screen */
+  #start { max-width:1100px; margin:22px auto; padding:0 14px; }
+  #start h1 { font-size:20px; margin:0 0 4px; }
+  #start > p { margin:0 0 16px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; box-shadow:var(--shadow); display:flex; flex-direction:column; gap:10px; }
+  .card h2 { font-size:15px; margin:0; display:flex; align-items:center; gap:8px; }
+  .card p { margin:0; color:var(--muted); }
+  .card .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .card .grow { margin-top:auto; }
+  .card input[type=text] { flex:1; min-width:0; }
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:7px; overflow:hidden; }
+  .seg label { padding:3px 10px; cursor:pointer; }
+  .seg input { display:none; }
+  .seg label:has(input:checked) { background:var(--accent); color:var(--accent-fg); }
+  .hint { font-size:12px; color:var(--muted); }
+  .tag-rec { font-size:11px; color:var(--accent); }
+
+  /* Toolbar */
+  #toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:8px 14px; border-bottom:1px solid var(--line); background:var(--card); }
+  #toolbar .spacer { flex:1; }
+  .group { display:inline-flex; align-items:center; gap:6px; }
+  #note { width:220px; }
+  #settings { display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center; padding:8px 14px; border-bottom:1px solid var(--line); background:var(--card); }
+  #settings input[type=text] { width:9ch; }
+  #settings .hint { flex-basis:100%; }
+  #serial-log { margin:0; padding:6px 14px; max-height:7.5em; overflow:auto; color:var(--muted); border-bottom:1px solid var(--line); font-size:12px; }
+
+  /* Plots */
+  #grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(440px, 1fr)); gap:10px; padding:10px 14px; }
+  .plot { position:relative; height:150px; background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; box-shadow:var(--shadow); }
+  .plot canvas { position:absolute; inset:26px 0 0 0; width:100%; height:calc(100% - 26px); display:block; }
+  .plot .head { position:absolute; left:10px; right:10px; top:5px; display:flex; gap:10px; align-items:baseline; pointer-events:none; }
+  .plot .lbl { font-weight:650; }
+  .plot .val { margin-left:auto; color:var(--muted); white-space:nowrap; }
+  .plot .val b { color:var(--fg); font-weight:600; }
+  .plot .stale { color:var(--amber); font-size:11px; }
+  #empty { text-align:center; padding:40px 14px; }
+
+  body.dropping::after { content:"Drop a raw EmotiBit .csv to replay it"; position:fixed; inset:0; display:grid; place-items:center; background:rgba(0,0,0,.55); color:#fff; font-size:20px; z-index:10; }
+  footer { padding:6px 14px 14px; color:var(--muted); font-size:12px; }
+  kbd { font-family:inherit; font-size:11px; border:1px solid var(--line); border-bottom-width:2px; border-radius:4px; padding:0 4px; }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">EmotiBit</span>
+  <span class="who"><span id="dot" class="dot"></span><span id="device">not connected</span><span id="src-badge" class="badge" hidden></span></span>
+  <span id="state" class="muted"></span>
+  <div class="stats">
+    <span class="chip" title="Battery charge reported by the device"><span class="k">battery</span><b id="battery" class="num">–</b></span>
+    <span class="chip" title="Packets (or Bluetooth records) per second"><span class="k">rate</span><b id="rate" class="num">–</b></span>
+    <span id="lost-chip" class="chip" title="Lost packets. WiFi: skipped packet numbers (a few per clock sync are normal). Bluetooth: missing per-channel record numbers."><span class="k">lost</span><b id="lost" class="num">0</b></span>
+    <span id="link-chip" class="chip" hidden title="Bluetooth link: wire format, ATT MTU, bytes per second, records the firmware had to drop"><span class="k">link</span><b id="link" class="num"></b></span>
+    <span id="clip-chip" class="chip" hidden title="Clipping and buffer-overflow events reported by the stock firmware"><span class="k">clip/over</span><b id="clip" class="num">0/0</b></span>
+    <span id="rec-chip" class="chip rec" hidden><b id="rec-text">REC</b></span>
+    <button id="change" hidden>Change source</button>
+    <button id="disconnect" class="danger" hidden>Disconnect</button>
+  </div>
+</header>
+<div id="banner"></div>
+
+<section id="start">
+  <h1>Connect to an EmotiBit</h1>
+  <p class="muted">Pick how the data gets here. Everything is decoded in this page (Rust compiled to WebAssembly).</p>
+  <div class="cards">
+    <div class="card">
+      <h2>Bluetooth <span class="badge">BLE firmware</span></h2>
+      <p>Straight from a board running <span class="mono">emotibit-ble</span>. No WiFi and no bridge; Chrome or Edge. Records on the board’s SD card or in the browser.</p>
+      <div class="row"><span class="hint">Wire format</span>
+        <span class="seg">
+          <label title="Delta + varint records, about 4x less airtime"><input type="radio" name="fmt" value="compact" checked>compact</label>
+          <label title="Plain 20-byte records"><input type="radio" name="fmt" value="raw">raw</label>
+        </span>
+      </div>
+      <div class="row grow"><button id="ble" class="primary">Connect Bluetooth…</button></div>
+      <span id="ble-why" class="hint" hidden></span>
+    </div>
+    <div class="card">
+      <h2>WiFi <span class="badge">stock firmware</span></h2>
+      <p>Through <span class="mono">emotibit serve</span>, which talks to the device on your network. Records to the SD card.</p>
+      <div class="row"><input id="bridge" type="text" spellcheck="false" placeholder="ws://127.0.0.1:8765/" class="mono"></div>
+      <div class="row grow"><button id="connect" class="primary">Connect</button></div>
+    </div>
+    <div class="card">
+      <h2>USB serial <span class="badge">stock firmware</span></h2>
+      <p>One signal over the Feather's USB port, using the firmware's debug mode. Reboots the board.</p>
+      <div class="row"><span class="hint">Signal</span><select id="sig"></select></div>
+      <div class="row grow"><button id="serial" class="primary">Connect USB…</button></div>
+      <span id="serial-why" class="hint" hidden></span>
+    </div>
+    <div class="card">
+      <h2>Without a device</h2>
+      <p>Synthetic data, or replay a raw recording (SD card <span class="mono">.csv</span>, or one saved from this page). You can also drop a file anywhere.</p>
+      <div class="row grow"><button id="demo">Demo data</button><button id="load">Open recording…</button></div>
+      <input id="file" type="file" accept=".csv,.txt" hidden>
+    </div>
+  </div>
+</section>
+
+<div id="toolbar" hidden>
+  <div class="group">
+    <button id="rec-btn">● Record</button>
+    <button id="sd-btn" hidden title="Record on the board’s SD card (continues if the page disconnects)">● Record on SD</button>
+    <label id="sd-bin-wrap" class="group" hidden title="Binary SD files are about 3x smaller; `emotibit parse` reads them"><input id="sd-bin" type="checkbox"> binary</label>
+    <input id="note" type="text" placeholder="Note for the recording" hidden>
+    <button id="note-btn" hidden>Add note</button>
+  </div>
+  <div class="group">
+    <span class="muted">Window</span>
+    <button id="win-" title="Shorter (←)">−</button><b id="win" class="num">10 s</b><button id="win+" title="Longer (→)">+</button>
+    <button id="pause" title="Space">Pause</button>
+  </div>
+  <label class="group" title="Overlay X/Y/Z of the motion sensors in one plot"><input id="grouped" type="checkbox" checked> group axes</label>
+  <label id="speedwrap" class="group" hidden>Speed
+    <select id="speed"><option>0.5</option><option selected>1</option><option>2</option><option>4</option><option>8</option></select>×
+  </label>
+  <span class="spacer"></span>
+  <button id="settings-btn" hidden title="The board's settings, kept in its flash">Settings…</button>
+  <label id="powerwrap" class="group" hidden>Power
+    <select id="mode">
+      <option value="">…</option>
+      <option value="normal">normal</option>
+      <option value="low">low</option>
+      <option value="max-low">max-low</option>
+      <option value="wireless-off">wireless-off</option>
+      <option value="hibernate">hibernate (powers down)</option>
+    </select>
+  </label>
+</div>
+<div id="settings" hidden>
+  <label class="group">Name <span class="muted mono">EmotiBit-BLE-</span><input id="set-name" type="text" maxlength="9" spellcheck="false" class="mono" placeholder="serial"></label>
+  <label class="group">PPG <select id="set-ppg"><option value="25">25 Hz</option><option value="100">100 Hz</option></select></label>
+  <label class="group"><input id="set-leds" type="checkbox"> status LEDs</label>
+  <label class="group" title="Flash: the board's own memory. SD card: CONFIG.TXT, which wins at boot (the rest of the file is kept; the original is saved as CONFIG.BAK).">Keep in <select id="set-store"><option value="flash">flash</option><option value="sd">SD card</option><option value="both">both</option></select></label>
+  <button id="set-save">Save</button>
+  <button id="set-restart" title="Save and restart the board (a new name needs it)">Save &amp; restart</button>
+  <span id="set-info" class="hint"></span>
+</div>
+<pre id="serial-log" hidden></pre>
+<div id="empty" class="muted" hidden>Waiting for data…</div>
+<div id="grid"></div>
+<footer><span id="foot"></span> · <kbd>←</kbd>/<kbd>→</kbd> window, <kbd>Space</kbd> pause</footer>
+<script type="module" src="./main.js"></script>
+</body>
+</html>

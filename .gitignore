@@ -1,0 +1,42 @@
+# ── Build outputs, anywhere (the host, the firmware, its vendored crates) ──────
+target/
+/release/
+# The bridge page's wasm build (scripts/build-web.sh) and its static site (--static dist)
+/web/pkg/
+/dist/
+# The Web Bluetooth page's build (examples/web/build.sh)
+/examples/web/dist/
+# Tracked on purpose: firmware/emotibit-ble.bin (embedded by build.rs), the Cargo.lock files,
+# firmware/emotibit-ble/.cargo/config.toml (its build target), the vendored crates' Cargo.toml.orig.
+
+# ── Downloads and local tools (scripts/cli.sh download / tools) ───────────────
+/.emotibit/
+
+# ── Board data: can hold WiFi credentials or recordings, never commit ─────────
+# Flash backups (`emotibit firmware backup`) include the stock firmware's saved WiFi.
+emotibit-backup-*.bin
+# The SD card's settings file holds WiFi credentials (any case: config.txt, CONFIG.TXT, CONFIG.BAK).
+[Cc][Oo][Nn][Ff][Ii][Gg].[Tt][Xx][Tt]
+[Cc][Oo][Nn][Ff][Ii][Gg].[Bb][Aa][Kk]
+# Recordings and their conversions (--record-dir, sd get, parse output)
+/rec/
+/recordings/
+/parsed/
+*_info.json
+*.ebb
+*.EBB
+/*.csv
+
+# ── Editors and OS ─────────────────────────────────────────────────────────────
+.DS_Store
+._*
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.env
+.env.*
+
+# ── Patch leftovers ────────────────────────────────────────────────────────────
+*.rej
