@@ -23,6 +23,9 @@ pub const MODE_UUID: &str = "6e6f7469-6269-7400-0000-000000000003";
 pub const CONTROL_UUID: &str = "6e6f7469-6269-7400-0000-000000000004";
 /// Device status and time-sync requests: stock packet lines (notify).
 pub const EVENTS_UUID: &str = "6e6f7469-6269-7400-0000-000000000005";
+/// Firmware update writes (`emotibit-ble` with update slots): begin, data, end; answers are
+/// `OT` lines on the events characteristic.
+pub const UPDATE_UUID: &str = "6e6f7469-6269-7400-0000-000000000006";
 
 /// Primary service UUID.
 pub const SERVICE_UUID: &str = "6e6f7469-6269-7400-0000-000000000001";
@@ -118,6 +121,9 @@ pub mod units;
 /// with the firmware.
 #[path = "shared/stock.rs"]
 pub mod stock;
+/// The firmware's numeric settings and profiles (`CS`/`CG`), shared verbatim with the firmware.
+#[path = "shared/tuning.rs"]
+pub mod tuning;
 
 /// Channel ids sent by the firmware.
 pub use stock::id;
@@ -366,6 +372,131 @@ mod client {
         connect_device(bt, compact).await
     }
 
+    /// Installs an emotibit-ble app image over Bluetooth: the board writes it into the app slot
+    /// it is not running, checks it (SHA-256, image hash), and restarts into it; a failed or
+    /// interrupted update leaves the running firmware as it was. The image goes compressed
+    /// ([`compress_image`]) to firmware that takes it, as it is otherwise. `progress` gets the bytes
+    /// sent and the total; the result is the bytes sent. The board needs emotibit-ble with update
+    /// slots, installed over USB once.
+    pub async fn update_firmware(bt: BluetoothDevice, image: &[u8], mut progress: impl FnMut(usize, usize)) -> Result<usize> {
+        use sha2::{Digest, Sha256};
+        /// Writes per window: the board's stack queues at most 8 incoming writes.
+        const WINDOW: usize = 6;
+        let name = bt.name().unwrap_or_else(|| bt.id().to_string());
+        let gatt = bt.gatt();
+        platform::timeout(Duration::from_secs(10), gatt.connect()).await.map_err(|_| anyhow!("{name}: connect timed out"))??;
+        let result = async {
+            let service = platform::timeout(Duration::from_secs(15), gatt.get_primary_service(uuid(SERVICE_UUID)))
+                .await
+                .map_err(|_| anyhow!("{name}: service discovery timed out"))??;
+            let chars = service.get_characteristics(None).await?;
+            let update = find(&chars, UPDATE_UUID)
+                .context("this firmware cannot be updated over Bluetooth: install the new one over USB once (emotibit firmware ble)")?;
+            let events = find(&chars, EVENTS_UUID).context("device has no events characteristic")?;
+            // `OT` answers, from their own task so they arrive while writes wait.
+            let mut stream = events.start_notifications().await?;
+            let (tx, mut rx) = mpsc::unbounded_channel::<Vec<String>>();
+            platform::spawn(async move {
+                while let Some(v) = stream.next().await {
+                    for p in protocol::split_message(&String::from_utf8_lossy(&v)).into_iter().flatten() {
+                        if p.tag == "OT" && tx.send(p.payload).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+            // The next answer other than progress.
+            async fn answer(rx: &mut mpsc::UnboundedReceiver<Vec<String>>, secs: u64) -> Result<Vec<String>> {
+                platform::timeout(Duration::from_secs(secs), async {
+                    loop {
+                        match rx.recv().await {
+                            Some(p) if p.first().is_some_and(|s| s == "progress") => continue,
+                            other => return other,
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| anyhow!("the board did not answer"))?
+                .ok_or_else(|| anyhow!("the link dropped"))
+            }
+            fn board_error(p: &[String]) -> anyhow::Error {
+                anyhow!("the board: {}", if p.first().is_some_and(|s| s == "error") { p[1..].join(",") } else { p.join(",") })
+            }
+
+            // Compressed first; firmware without it calls that write malformed.
+            let sha = Sha256::digest(image);
+            let compressed = compress_image(image);
+            let mut begin = vec![b'Z'];
+            begin.extend_from_slice(&(image.len() as u32).to_le_bytes());
+            begin.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+            begin.extend_from_slice(&sha);
+            update.write_value_with_response(&begin).await?;
+            let mut p = answer(&mut rx, 15).await?;
+            let mut data: &[u8] = &compressed;
+            if p.first().is_some_and(|s| s == "error") && p.get(1).is_some_and(|s| s == "malformed write") {
+                let mut begin = vec![b'B'];
+                begin.extend_from_slice(&(image.len() as u32).to_le_bytes());
+                begin.extend_from_slice(&sha);
+                update.write_value_with_response(&begin).await?;
+                p = answer(&mut rx, 15).await?;
+                data = image;
+            }
+            if p.first().map(String::as_str) != Some("ready") {
+                return Err(board_error(&p));
+            }
+            // Writes as long as the ATT MTU allows, less the header and offset. Firmware that takes
+            // them without response gets a window at a time, the last write of each with response
+            // (see the firmware's `ota`): several per connection interval instead of one per two.
+            let chunk = update.max_write_length(false).unwrap_or(185).clamp(32, 512) - 5;
+            let window = if update.properties().write_without_response() { WINDOW } else { 1 };
+            let total = data.len();
+            let chunks = total.div_ceil(chunk);
+            let mut sent = 0;
+            for (i, data) in data.chunks(chunk).enumerate() {
+                let mut w = Vec::with_capacity(5 + data.len());
+                w.push(b'D');
+                w.extend_from_slice(&(sent as u32).to_le_bytes());
+                w.extend_from_slice(data);
+                let synced = (i + 1) % window == 0 || i + 1 == chunks;
+                let written = if synced { update.write_value_with_response(&w).await } else { update.write_value_without_response(&w).await };
+                if let Err(e) = written {
+                    let _ = update.write_value_with_response(b"A").await;
+                    return Err(anyhow!("writing at byte {sent} failed: {e}"));
+                }
+                sent += data.len();
+                while let Ok(p) = rx.try_recv() {
+                    if p.first().is_some_and(|s| s == "error") {
+                        return Err(board_error(&p));
+                    }
+                }
+                progress(sent, total);
+            }
+            update.write_value_with_response(b"E").await?;
+            let p = answer(&mut rx, 60).await?;
+            if p.first().map(String::as_str) != Some("done") {
+                return Err(board_error(&p));
+            }
+            Ok(total)
+        }
+        .await;
+        gatt.disconnect();
+        result
+    }
+
+    /// An app image as the firmware takes it compressed: per 4 KB sector, a u16 (LE) length and
+    /// the sector as raw deflate, or as it is (the length's top bit set) when that is no shorter.
+    /// Each sector stands alone, so the board decompresses it without a 32 KB history.
+    pub fn compress_image(image: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(image.len());
+        for sector in image.chunks(4096) {
+            let packed = miniz_oxide::deflate::compress_to_vec(sector, 10);
+            let (head, body) = if packed.len() < sector.len() { (packed.len() as u16, &packed[..]) } else { (sector.len() as u16 | 0x8000, sector) };
+            out.extend_from_slice(&head.to_le_bytes());
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
     /// Device clock estimate from the timestamps of the lines the device sends (`EM` every
     /// second) and the batch clocks: the smallest `host - device` offset seen, i.e. the fastest
     /// delivery.
@@ -556,6 +687,41 @@ mod client {
 
 #[cfg(test)]
 mod tests {
+    /// The compressed update stream decodes back to the image, frame by frame as the firmware
+    /// reads it (`firmware/emotibit-ble/src/ota.rs`).
+    #[cfg(feature = "ble")]
+    #[test]
+    fn compressed_image_round_trips() {
+        // Compressible and incompressible sectors, and a short last one.
+        let mut image: Vec<u8> = (0..20_000u32).map(|i| (i / 7) as u8).collect();
+        let mut x = 0x1234_5678u32;
+        image.extend((0..5000).map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        }));
+        let stream = super::compress_image(&image);
+        assert!(stream.len() < image.len());
+        let (mut out, mut at, mut stored) = (Vec::new(), 0, 0);
+        while at < stream.len() {
+            let head = u16::from_le_bytes([stream[at], stream[at + 1]]);
+            let (len, raw) = ((head & 0x7FFF) as usize, head & 0x8000 != 0);
+            let body = &stream[at + 2..at + 2 + len];
+            if raw {
+                stored += 1;
+                out.extend_from_slice(body);
+            } else {
+                let sector = miniz_oxide::inflate::decompress_to_vec(body).unwrap();
+                assert!(sector.len() <= 4096);
+                out.extend_from_slice(&sector);
+            }
+            at += 2 + len;
+        }
+        assert_eq!(out, image);
+        assert!(stored >= 1, "random data is stored as it is");
+    }
+
     use super::*;
 
     #[test]

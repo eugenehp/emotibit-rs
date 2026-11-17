@@ -50,6 +50,9 @@ function fields(line) {
 }
 
 let clip = 0, over = 0;
+// Numeric settings shown in the Settings panel (ids set-<key>), and the board's last answer.
+const NUMS = ['led_brightness', 'cpu_mhz', 'sensor_ms', 'conn_ms', 'adv_ms', 'tx_dbm', 'ppg_led'];
+let shown = {};
 function onMessage(line) {
   const { tag, payload } = fields(line);
   const keyed = (k) => { const i = payload.indexOf(k); return i >= 0 ? payload[i + 1] ?? '' : undefined; };
@@ -60,9 +63,18 @@ function onMessage(line) {
       $('set-name').value = name === serial ? '' : name;
       $('set-ppg').value = keyed('ppg_hz') ?? '25';
       $('set-leds').checked = keyed('leds') === '1';
+      shown = { ppg_hz: $('set-ppg').value, leds: keyed('leds') ?? '1', profile: keyed('profile') ?? 'custom' };
+      // The clock it starts with next, so a pending change shows.
+      for (const k of NUMS) {
+        const v = k === 'cpu_mhz' ? keyed('cpu_mhz_next') ?? keyed(k) : keyed(k);
+        $(`set-${k}`).value = v ?? '';
+        $(`set-${k}`).disabled = v === undefined; // firmware without the setting
+        shown[k] = v;
+      }
+      $('set-profile').value = shown.profile;
       const from = { default: 'defaults', flash: 'flash', card: "the SD card's CONFIG.TXT (it wins at boot)" }[keyed('source')] ?? keyed('source');
       $('set-info').textContent = `${keyed('device_id') || 'no device id'} · settings from ${from}` +
-        (keyed('restart_needed') === '1' ? ' · the new name shows after a restart' : '');
+        (keyed('restart_needed') === '1' ? ' · a new name or CPU clock applies after a restart' : '');
       break;
     }
     case 'CS': case 'CW': case 'CC':
@@ -345,11 +357,27 @@ if (!navigator.bluetooth) {
   const save = (restart) => {
     const name = $('set-name').value.trim();
     if (!/^[A-Za-z0-9_-]{0,9}$/.test(name)) { $('set-info').textContent = 'Name: up to 9 letters, digits, - or _ (empty: the serial number).'; return; }
-    command('CS', 'name', name, 'ppg_hz', $('set-ppg').value, 'leds', $('set-leds').checked ? '1' : '0', 'store', $('set-store').value);
+    // A profile picked here sets everything; otherwise only what was changed is sent, so the
+    // board keeps matching its profile where it can.
+    const args = ['name', name];
+    const profile = $('set-profile').value;
+    if (profile !== 'custom' && profile !== shown.profile) args.push('profile', profile);
+    else {
+      const leds = $('set-leds').checked ? '1' : '0';
+      if ($('set-ppg').value !== shown.ppg_hz) args.push('ppg_hz', $('set-ppg').value);
+      if (leds !== shown.leds) args.push('leds', leds);
+      for (const k of NUMS) {
+        const v = $(`set-${k}`).value;
+        if (shown[k] !== undefined && v !== '' && v !== shown[k]) args.push(k, v);
+      }
+    }
+    command('CS', ...args, 'store', $('set-store').value);
     if (restart) { command('CR'); banner('Saved; the board restarts. Connect again when it is back.', 8000); }
     else setTimeout(() => command('CG'), 600);
   };
   $('set-save').onclick = () => save(false);
+  // Editing a setting by hand leaves the profile.
+  for (const id of ['set-ppg', 'set-leds', ...NUMS.map((k) => `set-${k}`)]) $(id).addEventListener('input', () => { $('set-profile').value = 'custom'; });
   $('set-restart').onclick = () => save(true);
   addEventListener('keydown', (e) => {
     if (['INPUT', 'SELECT'].includes(e.target.tagName) || $('toolbar').hidden) return;

@@ -129,7 +129,9 @@ emotibit stream --record-dir rec --seconds 60
 
 writes `rec/<device>_<time>.csv`, a **raw log** (one packet per line, the same format the device
 writes to its SD card), then converts it. `emotibit parse` does the same conversion for any raw
-file, including one copied off the SD card:
+file, including one copied off the SD card. With `--gzip` the log and the CSVs are gzipped
+(`.csv.gz`, about a sixth of the size: 3 MB instead of 17 MB for 10 minutes of a BLE board);
+`parse` reads gzipped files either way, including a log cut short by a crash:
 
 ```sh
 emotibit parse /Volumes/FLASHDEVICE/2026-11-05_18-25-09.csv --out parsed
@@ -312,6 +314,7 @@ Reference (protocol, file formats, internals, testing):
 
 ```sh
 emotibit firmware ble                        # install it over USB (the image is built in)
+emotibit --device EmotiBit-BLE-0001010 firmware ota   # later updates: over Bluetooth
 emotibit --transport ble scan                # EmotiBit-BLE-0001010  Bluetooth  available
 emotibit ble --seconds 20                    # stream, then per-channel stats and the link report
 emotibit selftest                            # each chip, SD card, EEPROM id, LEDs, battery: PASS/FAIL
@@ -386,12 +389,34 @@ deletes any single file (not `CONFIG.TXT`).
 ### Board settings
 
 ```sh
-emotibit config                              # name, PPG rate, LEDs, and where they come from
-emotibit config set ppg_hz=100 leds=0        # apply at once
-emotibit config set name=lab3 --restart      # advertise as EmotiBit-BLE-lab3 after a restart
-emotibit config set ppg_hz=100 --store sd # keep them in the card's CONFIG.TXT (or both)
-emotibit config clear --store both           # back to defaults at the next restart
+emotibit config                                 # every setting, the matching profile, where they come from
+emotibit config profiles                        # the settings and profiles (no board needed)
+emotibit config set profile=balanced --restart  # a profile (its CPU clock applies after the restart)
+emotibit config set profile=low_energy leds=1   # a profile, with the LEDs on anyway
+emotibit config set ppg_hz=100 leds=0           # apply at once
+emotibit config set tx_dbm=0 conn_ms=60         # radio: transmit power, connection interval
+emotibit config set name=lab3 --restart         # advertise as EmotiBit-BLE-lab3 after a restart
+emotibit config set ppg_hz=100 --store sd       # keep them in the card's CONFIG.TXT (or both)
+emotibit config clear --store both              # back to defaults at the next restart
 ```
+
+Besides the name, LEDs and PPG rate, the firmware has settings that trade battery life against
+rate, noise and range: LED brightness, CPU clock (80, 160 or 240 MHz), how often the sensor task
+wakes, the Bluetooth connection and advertising intervals, transmit power and the PPG LED
+current. Profiles set them together:
+
+| Profile | For |
+|---|---|
+| `default` | as shipped: everything as fast as it goes (240 MHz, sensors every 2 ms, 15 ms link, the radio's +9 dBm) |
+| `high_frequency` | PPG at 100 Hz, fastest CPU and link |
+| `low_noise` | every EDA conversion averaged, a brighter PPG LED, status LEDs off |
+| `balanced` | the stock firmware's 80 MHz; EDA still at every conversion; a 30 ms link at 0 dBm |
+| `energy_saving` | 80 MHz, sensors every 10 ms, a 60 ms link, slow advertising, dim LEDs |
+| `low_energy` | sensors every 20 ms, a 120 ms link at −6 dBm, a dimmer PPG LED, LEDs off |
+
+The values are in [firmware/emotibit-ble/README.md](firmware/emotibit-ble/README.md#settings).
+Power use has not been measured yet. To compare, put a meter between the battery and the board;
+a USB meter won't do, since on USB the board charges its battery.
 
 Settings are kept in the ESP32's flash (no card needed), in the card's `CONFIG.TXT`, or both;
 the card wins at boot. The firmware edits only its own `EmotiBitBle` section of `CONFIG.TXT`,
@@ -480,6 +505,7 @@ emotibit firmware ports                      # USB serial ports; the Feather sho
 emotibit firmware info                       # read-only: chip, MAC, flash, partitions, installed firmware
 emotibit firmware backup                     # whole flash → emotibit-backup-<MAC>-<date>.bin (about 1 min)
 emotibit firmware ble                        # install emotibit-ble (built in; --image FILE for another build)
+emotibit --device EmotiBit-BLE-0001010 firmware ota   # update emotibit-ble over Bluetooth, no USB
 emotibit firmware stock                      # install the stock firmware from the official installer's files
 emotibit firmware write FILE[@ADDRESS]... # any ESP32 image
 emotibit firmware restore BACKUP.bin         # put a backup back, all of it
@@ -492,13 +518,23 @@ board restarts into its firmware afterwards.
 
 | Command | Writes | Settings (`nvs`) |
 |---|---|---|
-| `ble` | bootloader, partition table, app, from a merged image | kept on an update; erased when coming from another firmware |
+| `ble` | bootloader, partition table, app, from a merged image; resets which app slot starts | kept on an update; erased when coming from another firmware |
+| `ota` | over Bluetooth: the app, into the board's other app slot | kept |
 | `stock` | the official installer's layout: bootloader@0x1000, partitions@0x8000, boot_app0@0xe000, app@0x10000 | same rule |
 | `write` | each file where it belongs: a merged image at 0, an app at 0x10000, a partition table at 0x8000; or `FILE@0x…` | untouched unless an image covers them |
 | `restore` | the whole file from address 0 | as in the backup |
 
-`info` names the installed firmware from its app descriptor: `emotibit-ble 0.1.0 (Bluetooth)`, or
-"an Arduino sketch" for the stock firmware (an Arduino build, which does not name itself).
+`info` names the installed firmware from its app descriptor: `emotibit-ble 0.1.1 (Bluetooth)`, or
+"an Arduino sketch" for the stock firmware (an Arduino build, which does not name itself), and
+with update slots, which one starts.
+
+**Updates over Bluetooth.** `firmware ota` needs no USB: the board writes the new app into its
+other app slot, checks it, and restarts into it; an interrupted or failed update changes
+nothing. It takes about a minute (two from firmware before the faster transfer). Pick the board with `--device` (without it, the only board in
+range); `--dry-run` checks the image and finds the board; `-y` skips the question. Boards
+running the first release need one `firmware ble` over USB first, for the slots (their
+settings are kept). Details in the
+[firmware README](firmware/emotibit-ble/README.md#updates-over-bluetooth).
 
 **Stock firmware files.** The bootloader, partition table and `boot_app0` come only with the
 official EmotiBit software ([ofxEmotiBit releases](https://github.com/EmotiBit/ofxEmotiBit/releases)).
@@ -567,13 +603,15 @@ reference, including its patched dependencies and how it was tested, is in
 2. Set the version in `Cargo.toml` (and `firmware/emotibit-ble/Cargo.toml`) and give it a
    section in `CHANGELOG.md`. `cargo publish --dry-run` checks that the crate packages and
    builds on its own (it carries `src/shared/` and `firmware/emotibit-ble.bin`).
-3. Tag it: `git tag v0.1.0 && git push origin v0.1.0`. `.github/workflows/release.yml` builds the archives
+3. Tag it: `git tag v0.1.1 && git push origin v0.1.1`. `.github/workflows/release.yml` builds the archives
    for macOS (arm64, x86_64), Linux (x86_64) and Windows (x86_64) and attaches them, with
    `SHA256SUMS`, to a GitHub release. `ci.yml` checks every push: clippy, tests, the wasm page,
    and the firmware build.
 
 `scripts/release.sh [--firmware] [--target TRIPLE]` builds the same archives locally, into
-`release/`. Each holds the binaries (the BLE image and, with wasm-pack installed, the bridge
+`release/`, with the `dist` profile (fat LTO, one codegen unit, stripped: about 40% smaller
+binaries than `--release`, for several times the build time). The web pages build with the `web`
+profile (`opt-level = "z"`) and `wasm-opt -Oz` if binaryen is installed: 346 KB instead of 785 KB. Each holds the binaries (the BLE image and, with wasm-pack installed, the bridge
 page built in), `firmware/emotibit-ble.bin`, the Web Bluetooth page (`web-ble/`), the docs and
 the licence; `emotibit-web-ble-<version>.zip` is the page alone, ready for any HTTPS host.
 

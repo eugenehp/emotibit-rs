@@ -15,6 +15,7 @@ use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 
 use crate::stock::{self, Fixed, Line};
+use crate::tuning::{self, n};
 
 /// One stock packet line (file downloads use long ones).
 pub type Text = Fixed<480>;
@@ -77,9 +78,9 @@ pub fn set_power(p: Power) {
     }
 }
 
-/// Whether sensor records go out over Bluetooth.
+/// Whether sensor records go out over Bluetooth (not during a firmware update).
 pub fn streaming() -> bool {
-    power() == Power::Normal
+    power() == Power::Normal && !crate::ota::ACTIVE.load(Relaxed)
 }
 
 // ── SD card ──────────────────────────────────────────────────────────────────
@@ -170,7 +171,7 @@ pub mod found {
     pub const LEDS: u32 = 1 << 7;
 }
 
-/// What the EEPROM says about the board, and the settings from `CONFIG.TXT`.
+/// What the EEPROM says about the board, and the settings in effect.
 #[derive(Clone)]
 pub struct Board {
     /// `MD-V6-0000356`, or empty when the EEPROM has no variant info.
@@ -182,15 +183,43 @@ pub struct Board {
     pub name: Fixed<24>,
     /// The name without settings: the serial number, or MAC bytes.
     pub default_name: Fixed<24>,
-    /// PPG output rate, Hz: 25 (stock) or 100 (stock's PPG-100 variant).
-    pub ppg_hz: u8,
     /// Drive the status LEDs.
     pub leds: bool,
+    /// The numeric settings in effect (`tuning::NUMBERS` order); `None`: the radio's default
+    /// transmit power. `cpu_mhz` is the clock the board runs at.
+    pub values: [Option<i16>; tuning::N],
 }
 
 impl Board {
     pub const fn new() -> Self {
-        Self { device_id: Fixed::new(), hardware: Fixed::new(), sku: Fixed::new(), name: Fixed::new(), default_name: Fixed::new(), ppg_hz: 25, leds: true }
+        let mut values = [None; tuning::N];
+        let mut i = 0;
+        while i < tuning::N {
+            values[i] = tuning::NUMBERS[i].default;
+            i += 1;
+        }
+        Self { device_id: Fixed::new(), hardware: Fixed::new(), sku: Fixed::new(), name: Fixed::new(), default_name: Fixed::new(), leds: true, values }
+    }
+
+    /// Setting `i` in effect, or its default (0 for the radio's own transmit power).
+    pub fn get(&self, i: usize) -> i16 {
+        self.values[i].or(tuning::NUMBERS[i].default).unwrap_or(0)
+    }
+
+    /// PPG output rate, Hz: 25 (stock) or 100 (stock's PPG-100 variant).
+    pub fn ppg_hz(&self) -> u8 {
+        self.get(n::PPG_HZ) as u8
+    }
+
+    /// Takes the settings that apply while running from `cfg`; `None` fields go back to the
+    /// defaults. The CPU clock is left alone (it changes at a restart).
+    pub fn apply(&mut self, cfg: &Config) {
+        self.leds = cfg.leds.unwrap_or(true);
+        for i in 0..tuning::N {
+            if !tuning::NUMBERS[i].restart {
+                self.values[i] = cfg.values[i].or(tuning::NUMBERS[i].default);
+            }
+        }
     }
 }
 
@@ -208,12 +237,22 @@ pub static CONFIG: Mutex<M, RefCell<Option<Config>>> = Mutex::new(RefCell::new(N
 /// The card task has looked for `CONFIG.TXT`.
 pub static CONFIG_DONE: AtomicBool = AtomicBool::new(false);
 
-/// The `"EmotiBitBle"` section of `CONFIG.TXT`; absent keys keep the defaults.
+/// Settings as stored (flash, or `CONFIG.TXT`'s `"EmotiBitBle"` section); absent ones keep the
+/// defaults.
 #[derive(Clone, Copy, Default)]
 pub struct Config {
     pub name: Option<Fixed<24>>,
-    pub ppg_hz: Option<u8>,
     pub leds: Option<bool>,
+    /// In `tuning::NUMBERS` order.
+    pub values: [Option<i16>; tuning::N],
+}
+
+impl Config {
+    pub const EMPTY: Self = Self { name: None, leds: None, values: [None; tuning::N] };
+
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none() && self.leds.is_none() && self.values.iter().all(Option::is_none)
+    }
 }
 
 pub fn board() -> Board {
@@ -233,31 +272,65 @@ pub enum Source {
 }
 
 /// The settings kept in flash, where the ones in effect came from, and whether a change waits
-/// for a restart (the advertised name).
-pub static STORED: Mutex<M, RefCell<(Config, Source, bool)>> = Mutex::new(RefCell::new((Config { name: None, ppg_hz: None, leds: None }, Source::Default, false)));
+/// for a restart (the advertised name, the CPU clock).
+pub static STORED: Mutex<M, RefCell<(Config, Source, bool)>> = Mutex::new(RefCell::new((Config::EMPTY, Source::Default, false)));
 /// Settings to write to flash (the main task owns the flash); `None` erases them.
 pub static SAVE: Channel<M, Option<Config>, 2> = Channel::new();
-/// The PPG rate changed; the sensor task sets the chip up again.
+/// The PPG rate or LED current changed; the sensor task sets the chip up again.
 pub static PPG_CHANGED: AtomicBool = AtomicBool::new(false);
+/// The sensor task's wake interval, ms (`sensor_ms`, read on every wake).
+pub static SENSOR_INTERVAL: AtomicU8 = AtomicU8::new(2);
 /// The host asked for a restart (`CR`).
 pub static RESTART: AtomicBool = AtomicBool::new(false);
 
-/// Sends `CG,name,…,ppg_hz,…,leds,…,source,default|flash|card,restart_needed,0|1,device_id,…`.
+/// Sends `CG,name,…,leds,…,<each of tuning::NUMBERS>,…,cpu_mhz_next,…,profile,…,source,
+/// default|flash|card,restart_needed,0|1,device_id,…`. `cpu_mhz` is the clock the board runs at,
+/// `cpu_mhz_next` the one it starts with next time; `tx_dbm` is what the radio uses; `profile`
+/// the one these settings match, or `custom`.
 pub fn report_settings() {
+    use core::fmt::Write as _;
     let b = board();
-    let (_, source, pending) = STORED.lock(|s| *s.borrow());
-    let mut hz = Fixed::<4>::new();
-    let _ = core::fmt::write(&mut hz, format_args!("{}", b.ppg_hz));
+    let (stored, source, pending) = STORED.lock(|s| *s.borrow());
+    let mut nums = [Fixed::<8>::new(); tuning::N];
+    for (i, f) in nums.iter_mut().enumerate() {
+        let v = if i == n::TX_DBM { crate::radio::tx_dbm() } else { b.get(i) };
+        let _ = write!(f, "{v}");
+    }
+    let mut cpu_next = Fixed::<8>::new();
+    let _ = write!(cpu_next, "{}", stored.values[n::CPU_MHZ].or(tuning::NUMBERS[n::CPU_MHZ].default).unwrap_or(0));
+    // The profile is matched on what is in effect, with the next start's CPU clock.
+    let mut values = b.values;
+    values[n::CPU_MHZ] = stored.values[n::CPU_MHZ];
+    let profile = tuning::matching(b.leds, &values).map_or("custom", |p| p.name);
     let src = match source {
         Source::Default => "default",
         Source::Flash => "flash",
         Source::Card => "card",
     };
-    emit(
-        "CG",
-        &["name", b.name.as_str(), "ppg_hz", hz.as_str(), "leds", if b.leds { "1" } else { "0" }, "source", src, "restart_needed", if pending { "1" } else { "0" }, "device_id", b.device_id.as_str()],
-        true,
-    );
+    let mut fields: [&str; 2 * (tuning::N + 7)] = [""; 2 * (tuning::N + 7)];
+    let mut at = 0;
+    for (key, value) in [("name", b.name.as_str()), ("leds", if b.leds { "1" } else { "0" })] {
+        fields[at] = key;
+        fields[at + 1] = value;
+        at += 2;
+    }
+    for (i, f) in nums.iter().enumerate() {
+        fields[at] = tuning::NUMBERS[i].key;
+        fields[at + 1] = f.as_str();
+        at += 2;
+    }
+    for (key, value) in [
+        ("cpu_mhz_next", cpu_next.as_str()),
+        ("profile", profile),
+        ("source", src),
+        ("restart_needed", if pending { "1" } else { "0" }),
+        ("device_id", b.device_id.as_str()),
+    ] {
+        fields[at] = key;
+        fields[at + 1] = value;
+        at += 2;
+    }
+    emit("CG", &fields[..at], true);
 }
 
 /// Where `CS` keeps the settings: flash (default), the card's `CONFIG.TXT`, or both.
@@ -296,7 +369,7 @@ fn clear_settings(fields: &[&str]) {
         if target != Store::Card {
             s.0 = Config::default();
         }
-        let flash_has = s.0.name.is_some() || s.0.ppg_hz.is_some() || s.0.leds.is_some();
+        let flash_has = !s.0.is_empty();
         s.1 = match (s.1, target) {
             (Source::Card, Store::Flash) => Source::Card,
             _ if flash_has => Source::Flash,
@@ -307,11 +380,15 @@ fn clear_settings(fields: &[&str]) {
 }
 
 /// `CS,key,value,...`: `name` (up to 9 letters, digits, '-' or '_'; empty restores the default),
-/// `ppg_hz` (25 or 100), `leds` (0/1), and `store` (`flash`, the default, `sd` or `both`).
-/// LEDs and PPG rate apply at once, the name after a restart.
+/// `leds` (0/1), any of `tuning::NUMBERS`, `profile` (`tuning::PROFILES`: sets the LEDs and every
+/// number; keys after it override it), and `store` (`flash`, the default, `sd` or `both`). The
+/// CPU clock is always kept in flash too, since it is set before the card can be read. The name
+/// and CPU clock apply after a restart, the rest at once.
 fn set_settings(fields: &[&str]) {
+    use core::fmt::Write as _;
     let (mut cfg, _, _) = STORED.lock(|s| *s.borrow());
     let mut target = Store::Flash;
+    let mut why = Fixed::<96>::new();
     for kv in fields.chunks(2) {
         let [key, value] = kv else {
             emit("CS", &["error", "fields come in key/value pairs"], true);
@@ -323,23 +400,29 @@ fn set_settings(fields: &[&str]) {
                     emit("CS", &["error", "name: up to 9 letters or digits or - or _"], true);
                     return;
                 }
-                let mut n = Fixed::<24>::new();
-                let _ = core::fmt::Write::write_str(&mut n, value);
-                cfg.name = (!value.is_empty()).then_some(n);
+                let mut name = Fixed::<24>::new();
+                let _ = name.write_str(value);
+                cfg.name = (!value.is_empty()).then_some(name);
             }
-            "ppg_hz" => match *value {
-                "25" => cfg.ppg_hz = Some(25),
-                "100" => cfg.ppg_hz = Some(100),
-                _ => {
-                    emit("CS", &["error", "ppg_hz: 25 or 100"], true);
-                    return;
-                }
-            },
             "leds" => match *value {
                 "1" | "true" => cfg.leds = Some(true),
                 "0" | "false" => cfg.leds = Some(false),
                 _ => {
                     emit("CS", &["error", "leds: 0 or 1"], true);
+                    return;
+                }
+            },
+            "profile" => match tuning::profile(value) {
+                Some(p) => {
+                    cfg.leds = Some(p.leds);
+                    cfg.values = p.values;
+                }
+                None => {
+                    let _ = why.write_str("profile:");
+                    for p in &tuning::PROFILES {
+                        let _ = write!(why, " {}", p.name);
+                    }
+                    emit("CS", &["error", why.as_str()], true);
                     return;
                 }
             },
@@ -350,29 +433,47 @@ fn set_settings(fields: &[&str]) {
                     return;
                 }
             },
-            _ => {
-                emit("CS", &["error", "unknown setting (name; ppg_hz; leds; store)"], true);
-                return;
+            key => {
+                let Some(i) = tuning::number(key) else {
+                    emit("CS", &["error", "unknown setting (name; leds; profile; store; ppg_hz; led_brightness; cpu_mhz; sensor_ms; conn_ms; adv_ms; tx_dbm; ppg_led)"], true);
+                    return;
+                };
+                let setting = &tuning::NUMBERS[i];
+                match value.parse::<i16>().ok().filter(|v| setting.allowed.contains(*v)) {
+                    Some(v) => cfg.values[i] = Some(v),
+                    None => {
+                        let _ = write!(why, "{}: ", setting.key);
+                        let _ = match setting.allowed {
+                            tuning::Allowed::Range(lo, hi) => write!(why, "{lo} to {hi}"),
+                            tuning::Allowed::OneOf(vs) => vs.iter().enumerate().try_for_each(|(j, v)| write!(why, "{}{v}", if j > 0 { " or " } else { "" })),
+                        };
+                        emit("CS", &["error", why.as_str()], true);
+                        return;
+                    }
+                }
             }
         }
     }
     let source = STORED.lock(|s| s.borrow().1);
-    // A restart is needed when the name to advertise differs from the one on the air.
+    // A restart is needed when the name to advertise differs from the one on the air, or the
+    // CPU clock from the one the board runs at.
     let b = board();
     let wanted = cfg.name.as_ref().map_or(b.default_name.as_str(), |n| n.as_str());
     let name_changed = wanted != b.name.as_str();
+    let cpu_changed = cfg.values[n::CPU_MHZ].or(tuning::NUMBERS[n::CPU_MHZ].default) != b.values[n::CPU_MHZ];
     // Apply what can change while running.
     BOARD.lock(|b| {
         let mut b = b.borrow_mut();
-        if let Some(l) = cfg.leds {
-            b.leds = l;
+        let before = b.clone();
+        b.apply(&cfg);
+        if b.get(n::PPG_HZ) != before.get(n::PPG_HZ) || b.get(n::PPG_LED) != before.get(n::PPG_LED) {
+            PPG_CHANGED.store(true, Relaxed);
         }
-        if let Some(hz) = cfg.ppg_hz
-            && b.ppg_hz != hz {
-                b.ppg_hz = hz;
-                PPG_CHANGED.store(true, Relaxed);
-            }
+        SENSOR_INTERVAL.store(b.get(n::SENSOR_MS) as u8, Relaxed);
     });
+    if cfg.values[n::TX_DBM] != b.values[n::TX_DBM] && !crate::radio::set_tx_dbm(cfg.values[n::TX_DBM]) {
+        log::warn!("settings: the radio refused transmit power {:?} dBm", cfg.values[n::TX_DBM]);
+    }
     STORED.lock(|s| {
         let mut s = s.borrow_mut();
         s.0 = cfg;
@@ -381,9 +482,10 @@ fn set_settings(fields: &[&str]) {
             (Store::Flash, _) => Source::Flash,
             _ => Source::Card,
         };
-        s.2 = name_changed;
+        s.2 = name_changed || cpu_changed;
     });
-    if target != Store::Card {
+    // The CPU clock is read from flash at boot, wherever the rest is kept.
+    if target != Store::Card || cpu_changed {
         let _ = SAVE.try_send(Some(cfg));
     }
     if target != Store::Flash {
@@ -544,9 +646,9 @@ fn command(l: &Line) {
         "CC" => clear_settings(fields),
         "CS" => {
             // Empty values count here (`name,` restores the default name), so split by hand.
-            let mut raw: [&str; 8] = [""; 8];
+            let mut raw: [&str; 32] = [""; 32];
             let mut k = 0;
-            for f in l.payload.split(',').take(8) {
+            for f in l.payload.split(',').take(32) {
                 raw[k] = f;
                 k += 1;
             }

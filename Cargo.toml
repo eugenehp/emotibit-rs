@@ -1,6 +1,6 @@
 [package]
 name         = "emotibit"
-version      = "0.1.0"
+version      = "0.1.1"
 edition      = "2024"
 # webbluetooth needs it (as in muse-rs); declared rather than found halfway through a build.
 rust-version = "1.94"
@@ -10,7 +10,6 @@ keywords     = ["emotibit", "eda", "ppg", "imu", "biosignals"]
 categories   = ["science", "hardware-support", "wasm"]
 authors      = ["Eugene Hauptmann"]
 license      = "Apache-2.0"
-homepage     = "https://github.com/eugenehp/emotibit-rs"
 repository   = "https://github.com/eugenehp/emotibit-rs"
 documentation = "https://docs.rs/emotibit"
 # The firmware's sources and vendored crates build with their own toolchain; the package carries
@@ -87,7 +86,7 @@ required-features = ["ble"]
 [features]
 default = ["flash", "tui", "lsl", "osc", "ws", "ble"]
 serial  = ["dep:serialport"]
-ble     = ["dep:webbluetooth", "dep:uuid", "dep:futures-util", "dep:webbluetooth-wasm"]
+ble     = ["dep:webbluetooth", "dep:uuid", "dep:futures-util", "dep:webbluetooth-wasm", "dep:sha2", "dep:miniz_oxide"]
 webscope = ["dep:wasm-bindgen"]
 flash   = ["serial", "dep:espflash", "dep:indicatif"]
 tui     = ["dep:ratatui", "dep:crossterm"]
@@ -108,7 +107,10 @@ tokio      = { version = "1", default-features = false, features = ["sync", "mac
 uuid              = { version = "1", optional = true }
 futures-util      = { version = "0.3", optional = true }
 # Held at the version webbluetooth-wasm pairs with (as muse-rs does).
-webbluetooth      = { version = "0.0.4", features = ["uuid"], optional = true }
+webbluetooth      = { version = "0.0.5", features = ["uuid"], optional = true }
+# Firmware updates over Bluetooth: the image's digest, checked by the board.
+sha2              = { version = "0.10", optional = true }
+miniz_oxide       = { version = "0.8", optional = true }
 
 # ── Native-only dependencies ──────────────────────────────────────────────────
 
@@ -117,6 +119,8 @@ chrono     = { version = "0.4", default-features = false, features = ["clock"] }
 clap       = { version = "4", features = ["derive", "env"] }
 env_logger = "0.11"
 if-addrs   = "0.15"
+# Gzipped recordings (`--gzip`); already there through espflash.
+flate2     = "1"
 tokio      = { version = "1", features = ["net", "time", "sync", "io-util", "signal", "fs", "rt-multi-thread", "macros"] }
 
 espflash   = { version = "4.7", default-features = false, features = ["serialport"], optional = true }
@@ -135,5 +139,22 @@ tokio-tungstenite = { version = "0.26", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { version = "0.2", optional = true }
-# The executor and setTimeout `platform` uses in a page; the same 0.0.4 webbluetooth pairs with.
-webbluetooth-wasm = { version = "0.0.4", optional = true }
+# The executor and setTimeout `platform` uses in a page; the same 0.0.5 webbluetooth pairs with.
+webbluetooth-wasm = { version = "0.0.5", optional = true }
+# Release archives (`scripts/release.sh`): about 40% smaller binaries, for several times the
+# build time of `--release`.
+[profile.dist]
+inherits      = "release"
+lto           = "fat"
+codegen-units = 1
+strip         = true
+
+# The web pages' wasm (`examples/web/build.sh`, `scripts/build-web.sh`): as small as it goes; they
+# decode a few hundred records a second. Then `wasm-opt -Oz`.
+[profile.web]
+inherits  = "dist"
+opt-level = "z"
+panic     = "abort"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-sign-ext", "--enable-mutable-globals"]

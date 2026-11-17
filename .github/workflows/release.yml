@@ -1,4 +1,4 @@
-# On a version tag (v0.1.0): build the release archives on each OS and attach them to a GitHub
+# On a version tag (v0.1.1): build the release archives on each OS and attach them to a GitHub
 # release. Each archive embeds firmware/emotibit-ble.bin as committed; rebuild it locally with
 # scripts/ble-firmware.sh before tagging when the firmware changed.
 name: Release
@@ -35,7 +35,7 @@ jobs:
           targets: wasm32-unknown-unknown,${{ matrix.target }}
       - name: Linux packages
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libudev-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libudev-dev pkg-config binaryen
       # The build scripts run python3 (or python): a real one, not Windows' Store alias.
       - uses: actions/setup-python@v5
         with:
@@ -51,7 +51,7 @@ jobs:
         with:
           name: release-${{ matrix.target }}
           path: |
-            release/emotibit-[0-9]*.tar.gz
+            release/emotibit-[0-9]*.tar.xz
             release/emotibit-[0-9]*.zip
             release/SHA256SUMS-${{ matrix.target }}
       # The web page is the same everywhere: published once.

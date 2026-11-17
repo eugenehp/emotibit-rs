@@ -100,23 +100,32 @@ enum Chip {
     Ktd,
 }
 
-/// The LED driver, with the state last sent.
+/// The LED driver, with the state and brightness last sent.
 pub struct LedDriver {
     chip: Chip,
     sent: Option<Leds>,
+    /// 1-31: the NCP5623's PWM level; twice that in the KTD2026's 0.125 mA current steps. The
+    /// stock firmware's 8 is PWM 8 of 31, or 2 mA.
+    brightness: u8,
 }
 
-/// NCP5623 brightness (0-31) and driver current, as the stock firmware sets them.
-const NCP_PWM: u8 = 8;
+/// NCP5623 driver current, as the stock firmware sets it.
 const NCP_CURRENT: u8 = 1;
 const KTD: u8 = 0x31;
-/// KTD2026 channel current: 2 mA (0x10 of 192 steps to 24 mA), as the stock firmware.
-const KTD_IOUT: u8 = 0x10;
+
+/// KTD2026 channel current registers (0x06-0x08) for a brightness.
+async fn ktd_current<I: I2c>(i2c: &mut I, brightness: u8) -> bool {
+    let mut ok = true;
+    for reg in [0x06, 0x07, 0x08] {
+        ok &= i2c.write(KTD, &[reg, brightness.clamp(1, 31) * 2]).await.is_ok();
+    }
+    ok
+}
 
 impl LedDriver {
     /// Finds the driver for this hardware version (stock numbering: 7 = V05c, 8 = V06a,
     /// 9 = V07a; unknown: try all) and turns the LEDs off.
-    pub async fn new<I: I2c>(i2c: &mut I, hw_version: Option<u8>) -> Option<Self> {
+    pub async fn new<I: I2c>(i2c: &mut I, hw_version: Option<u8>, brightness: u8) -> Option<Self> {
         let chips: &[Chip] = match hw_version {
             Some(v) if v >= 9 => &[Chip::Ktd],
             Some(v) if v <= 7 => &[Chip::Ncp(0x38), Chip::Ncp(0x39)],
@@ -128,15 +137,12 @@ impl LedDriver {
                 // Register 1 (ILED): the driver current.
                 Chip::Ncp(addr) => i2c.write(addr, &[(1 << 5) | NCP_CURRENT]).await.is_ok(),
                 Chip::Ktd => {
-                    let mut ok = i2c.write(KTD, &[0x00, 0x00]).await.is_ok(); // enable
-                    for reg in [0x06, 0x07, 0x08] {
-                        ok &= i2c.write(KTD, &[reg, KTD_IOUT]).await.is_ok();
-                    }
-                    ok
+                    let ok = i2c.write(KTD, &[0x00, 0x00]).await.is_ok(); // enable
+                    ok && ktd_current(i2c, brightness).await
                 }
             };
             if ok {
-                let mut d = Self { chip, sent: None };
+                let mut d = Self { chip, sent: None, brightness: brightness.clamp(1, 31) };
                 d.set(i2c, Leds::default()).await;
                 return Some(d);
             }
@@ -159,7 +165,7 @@ impl LedDriver {
                     }
                     // Registers 2-4: one PWM channel each.
                     let reg = (2 + i as u8) << 5;
-                    let _ = i2c.write(addr, &[if on { reg | NCP_PWM } else { reg }]).await;
+                    let _ = i2c.write(addr, &[if on { reg | self.brightness } else { reg }]).await;
                 }
             }
             Chip::Ktd => {
@@ -169,5 +175,25 @@ impl LedDriver {
             }
         }
         self.sent = Some(leds);
+    }
+
+    /// Changes the brightness (1-31) of the LEDs that are on, and of the ones turned on later.
+    pub async fn set_brightness<I: I2c>(&mut self, i2c: &mut I, brightness: u8) {
+        let brightness = brightness.clamp(1, 31);
+        if brightness == self.brightness {
+            return;
+        }
+        self.brightness = brightness;
+        match self.chip {
+            // The PWM level is sent with each LED: send the lit ones again.
+            Chip::Ncp(_) => {
+                if let Some(leds) = self.sent.take() {
+                    self.set(i2c, leds).await;
+                }
+            }
+            Chip::Ktd => {
+                ktd_current(i2c, brightness).await;
+            }
+        }
     }
 }

@@ -155,7 +155,7 @@ where
                 };
                 log::info!("recording to {} ({})", name.as_str(), if binary { "binary" } else { "csv" });
                 let board = control::board();
-                derived = crate::derive::Derived::new(board.ppg_hz as f64, 15.625);
+                derived = crate::derive::Derived::new(board.ppg_hz() as f64, 15.625);
                 let mut o = Open {
                     file,
                     binary,
@@ -516,7 +516,7 @@ fn write_info<D: embedded_sdmmc::BlockDevice, T: TimeSource>(mgr: &VolumeManager
         sku: board.sku.as_str(),
         firmware_version: env!("CARGO_PKG_VERSION"),
         created_at: stamp,
-        ppg_hz: board.ppg_hz as f64,
+        ppg_hz: board.ppg_hz() as f64,
         temp_humidity: si7013,
         session: Some(stock::SessionInfo {
             data_file: o.name.as_str(),
@@ -859,11 +859,12 @@ fn save_config<D: embedded_sdmmc::BlockDevice, T: TimeSource>(
         Err(_) => false,
     };
     let text = core::str::from_utf8(&old[..n]).map_err(|_| "CONFIG.TXT is not text")?;
-    let mut section = Fixed::<96>::new();
+    let mut section = Fixed::<256>::new();
     if let Some(c) = cfg {
-        stock::write_settings_section(&mut section, c.name.as_ref().map(|n| n.as_str()), c.ppg_hz, c.leds).map_err(|_| "settings too long")?;
+        let numbers: [(&str, Option<i16>); crate::tuning::N] = core::array::from_fn(|i| (crate::tuning::NUMBERS[i].key, c.values[i]));
+        stock::write_settings_section(&mut section, c.name.as_ref().map(|n| n.as_str()), c.leds, &numbers).map_err(|_| "settings too long")?;
     }
-    let mut new = Fixed::<{ CONFIG_MAX + 128 }>::new();
+    let mut new = Fixed::<{ CONFIG_MAX + 288 }>::new();
     stock::json_with_member(text, "EmotiBitBle", cfg.map(|_| section.as_str()), &mut new).map_err(|_| "CONFIG.TXT is not a JSON object; left unchanged")?;
     if !existed && cfg.is_none() {
         return Ok("no CONFIG.TXT");
@@ -893,7 +894,8 @@ fn set_config(c: Option<control::Config>) {
 }
 
 /// The `"EmotiBitBle"` object of `CONFIG.TXT`, for example
-/// `{"WifiCredentials": [...], "EmotiBitBle": {"name": "lab-3", "ppg_hz": 100, "leds": true}}`.
+/// `{"WifiCredentials": [...], "EmotiBitBle": {"name": "lab-3", "ppg_hz": 100, "leds": true}}`;
+/// also `profile` and every key of `tuning::NUMBERS` (a key wins over the profile).
 /// The rest of the file (WiFi credentials) is neither kept nor logged.
 fn read_config<D: embedded_sdmmc::BlockDevice, T: TimeSource>(mgr: &VolumeManager<D, T, 2, 2, 1>, root: RawDirectory) -> Option<control::Config> {
     let mut cfg = control::Config::default();
@@ -919,17 +921,26 @@ fn read_config<D: embedded_sdmmc::BlockDevice, T: TimeSource>(mgr: &VolumeManage
             cfg.name = Some(f);
         }
     }
-    cfg.ppg_hz = stock::json_value(section, "ppg_hz").and_then(|v| v.parse::<u8>().ok()).filter(|v| *v == 25 || *v == 100);
     cfg.leds = stock::json_value(section, "leds").and_then(|v| match v {
         "true" => Some(true),
         "false" => Some(false),
         _ => None,
     });
+    // A profile first, then single keys over it.
+    if let Some(p) = stock::json_value(section, "profile").and_then(crate::tuning::profile) {
+        cfg.leds = cfg.leds.or(Some(p.leds));
+        cfg.values = p.values;
+    }
+    for (i, setting) in crate::tuning::NUMBERS.iter().enumerate() {
+        if let Some(v) = stock::json_value(section, setting.key).and_then(|v| v.parse::<i16>().ok()).filter(|v| setting.allowed.contains(*v)) {
+            cfg.values[i] = Some(v);
+        }
+    }
     log::info!(
-        "settings: name {} ppg {} Hz leds {}",
+        "settings: name {} leds {} {:?}",
         cfg.name.as_ref().map_or("(default)", |n| n.as_str()),
-        cfg.ppg_hz.unwrap_or(25),
-        cfg.leds.unwrap_or(true)
+        cfg.leds.unwrap_or(true),
+        cfg.values
     );
     Some(cfg)
 }

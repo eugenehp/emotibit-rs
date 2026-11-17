@@ -40,3 +40,6 @@ emotibit-backup-*.bin
 
 # ── Patch leftovers ────────────────────────────────────────────────────────────
 *.rej
+
+# ── Python caches (scripts/power-report.py) ────────────────────────────────────
+__pycache__/

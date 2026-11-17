@@ -6,7 +6,7 @@
 #   scripts/release.sh --target TRIPLE     # cross-compile the host tools (rustup target add TRIPLE)
 #
 # Produces, with <v> the crate version and <t> the target triple:
-#   release/emotibit-<v>-<t>.tar.gz (.zip on Windows)
+#   release/emotibit-<v>-<t>.tar.xz (.zip on Windows; xz is half the size of gzip here)
 #       emotibit, emotibit-flash     the command line, TUI, bridge, and the flasher; both have the
 #                                       emotibit-ble image (and the bridge page, if built) inside
 #       firmware/emotibit-ble.bin       the BLE firmware, for other flashers (esptool write-flash 0)
@@ -59,8 +59,8 @@ examples/web/build.sh >/dev/null
 echo "examples/web/dist"
 
 step "Host tools ($triple)"
-cargo build --release --locked --bins ${target:+--target "$target"}
-bin_dir=target/${target:+$target/}release
+cargo build --profile dist --locked --bins ${target:+--target "$target"}
+bin_dir=target/${target:+$target/}dist
 
 step "Archives"
 name="emotibit-$version-$triple"
@@ -80,11 +80,11 @@ cp README.md CHANGELOG.md LICENSE "$stage/"
     powershell -NoProfile -Command "Compress-Archive -Force -Path '$name' -DestinationPath '$name.zip'"
     archive="$name.zip"
   else
-    tar -czf "$name.tar.gz" "$name"
-    archive="$name.tar.gz"
+    tar -cf - "$name" | xz -9e > "$name.tar.xz"
+    archive="$name.tar.xz"
   fi
   (cd "$name/web-ble" && "$py" -I -c 'import sys, zipfile, os
-with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED) as z:
+with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
     for f in sorted(os.listdir(".")):
         z.write(f)' "../../emotibit-web-ble-$version.zip")
   if command -v sha256sum >/dev/null; then sum="sha256sum"; else sum="shasum -a 256"; fi

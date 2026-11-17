@@ -57,6 +57,24 @@ struct Args {
     /// BLE wire format: compact (delta + varint, about 4x less airtime) or raw (20-byte records)
     #[arg(long, global = true, value_parser = ["compact", "raw"], default_value = "compact")]
     ble_format: String,
+
+    /// Gzip recordings: the raw log (`--record-dir`) and the per-signal CSVs (`.csv.gz`, about a
+    /// sixth of the size). `parse` reads gzipped files either way
+    #[arg(long, global = true)]
+    gzip: bool,
+}
+
+/// `--gzip`, for every recording this run makes.
+static GZIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn gzip() -> bool {
+    GZIP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A new raw log's name in `dir`: `<device>_<date>.csv`, or `.csv.gz` with `--gzip`.
+fn raw_log_path(dir: &Path, device: &str) -> PathBuf {
+    let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+    dir.join(format!("{device}_{stamp}.csv{}", if gzip() { ".gz" } else { "" }))
 }
 
 /// Where to send the data besides the screen.
@@ -323,8 +341,10 @@ enum SdAction {
 enum ConfigAction {
     /// Show the settings in effect and where they come from (the default)
     Show,
-    /// Change settings: name=<up to 9 chars, empty for the default>, ppg_hz=25|100, leds=0|1.
-    /// LEDs and PPG rate apply at once, the name after a restart.
+    /// Change settings: profile=<name> (see `config profiles`), name=<up to 9 chars, empty for
+    /// the default>, leds=0|1, and any of ppg_hz, led_brightness, cpu_mhz, sensor_ms, conn_ms,
+    /// adv_ms, tx_dbm, ppg_led. Keys after a profile override it. The name and CPU clock apply
+    /// after a restart, the rest at once.
     Set {
         #[arg(value_name = "KEY=VALUE", required = true)]
         settings: Vec<String>,
@@ -343,14 +363,23 @@ enum ConfigAction {
     },
     /// Restart the board
     Restart,
+    /// List the profiles and every numeric setting (no board needed)
+    Profiles,
 }
 
 pub fn run() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
+    GZIP.store(args.gzip, std::sync::atomic::Ordering::Relaxed);
     // Serial and blocking: no runtime needed.
     #[cfg(feature = "flash")]
     if let Some(Command::Firmware { action }) = args.command {
+        // Over Bluetooth: needs the runtime (without Bluetooth, `flasher::run` says so).
+        #[cfg(feature = "ble")]
+        if let emotibit::flasher::FirmwareCommand::Ota { image, dry_run, yes } = action {
+            let timeout = Duration::from_secs(args.timeout);
+            return tokio::runtime::Runtime::new()?.block_on(firmware_ota(args.device, timeout, image, dry_run, yes));
+        }
         return emotibit::flasher::run(action);
     }
     let rt = tokio::runtime::Runtime::new()?;
@@ -618,8 +647,7 @@ async fn stream_one(
     let logger = match &opts.record_dir {
         Some(dir) => {
             std::fs::create_dir_all(dir)?;
-            let name = format!("{}_{}.csv", id, chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"));
-            let path = dir.join(name);
+            let path = raw_log_path(dir, &id);
             eprintln!("{prefix}Logging raw packets to {}", path.display());
             Some((path.clone(), datafile::spawn_raw_logger(&handle, path).await?))
         }
@@ -754,7 +782,7 @@ async fn stream_one(
     if let Some((path, task)) = logger {
         let lines = task.await??;
         eprintln!("{prefix}Logged {lines} packets. Converting...");
-        report(&datafile::parse_file(&path, path.parent())?, &prefix);
+        report(&datafile::parse_file(&path, path.parent(), gzip())?, &prefix);
     }
     Ok(())
 }
@@ -778,7 +806,7 @@ fn report(r: &datafile::ParseReport, prefix: &str) {
 // ── parse / power / tui ──────────────────────────────────────────────────────
 
 fn parse(file: &Path, out: Option<&Path>) -> Result<()> {
-    let r = datafile::parse_file(file, out)?;
+    let r = datafile::parse_file(file, out, gzip())?;
     report(&r, "");
     Ok(())
 }
@@ -938,7 +966,7 @@ async fn sd(mut config: EmotiBitClientConfig, action: SdAction) -> Result<()> {
                 let secs = started.elapsed().as_secs_f64();
                 eprintln!("Saved {} ({} bytes, {:.1} kB/s)", path.display(), data.len(), data.len() as f64 / 1000.0 / secs);
                 if convert {
-                    report(&datafile::parse_file(&path, Some(&out))?, "");
+                    report(&datafile::parse_file(&path, Some(&out), gzip())?, "");
                 }
                 Ok(())
             }
@@ -1026,7 +1054,124 @@ async fn session_op(handle: &EmotiBitHandle, rx: &mut Receiver<EmotiBitEvent>, t
     }
 }
 
+/// `config profiles`: the settings table and the profiles, from the code the firmware shares.
+fn print_profiles() {
+    use emotibit::ble::tuning::{Allowed, NUMBERS, PROFILES};
+    println!("Settings (emotibit config set KEY=VALUE ...):");
+    for s in &NUMBERS {
+        let allowed = match s.allowed {
+            Allowed::Range(lo, hi) => format!("{lo}-{hi}"),
+            Allowed::OneOf(vs) => vs.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("|"),
+        };
+        let default = s.default.map_or("radio's own".to_string(), |d| d.to_string());
+        let unit = if s.unit.is_empty() { String::new() } else { format!(" {}", s.unit) };
+        println!("  {:<15} {:<22} default {default}{unit}{}", s.key, allowed, if s.restart { ", after a restart" } else { "" });
+        println!("  {:<15} {}", "", s.help);
+    }
+    println!("\nProfiles (emotibit config set profile=NAME [KEY=VALUE ...] --restart):");
+    let header: Vec<String> = NUMBERS.iter().map(|s| s.key.to_string()).collect();
+    println!("  {:<15} {:<5} {}", "", "leds", header.iter().map(|h| format!("{h:>15}")).collect::<String>());
+    for p in &PROFILES {
+        let values: String = p.values.iter().map(|v| format!("{:>15}", v.map_or("-".to_string(), |v| v.to_string()))).collect();
+        println!("  {:<15} {:<5} {values}", p.name, if p.leds { "on" } else { "off" });
+    }
+    println!();
+    for p in &PROFILES {
+        println!("  {:<15} {}", p.name, p.help);
+    }
+    println!("\nThe CPU clock applies after a restart (--restart); the rest at once. Power use was not measured.");
+}
+
+/// `emotibit firmware ota`: the emotibit-ble app over Bluetooth to one board (named, or the only
+/// one in range), then waits for it to come back.
+#[cfg(all(feature = "flash", feature = "ble"))]
+async fn firmware_ota(device: Option<String>, timeout: Duration, image: Option<PathBuf>, dry_run: bool, yes: bool) -> Result<()> {
+    let (app, what) = emotibit::flasher::ota_image(image.as_deref())?;
+    println!("Image: {what} ({} KB)", app.len() / 1024);
+    let name = match device {
+        Some(d) => d,
+        None => {
+            let found = emotibit::ble::scan(timeout).await?;
+            match found.as_slice() {
+                [(d, _)] => d.id.clone(),
+                [] => bail!("no EmotiBit found over Bluetooth"),
+                many => {
+                    let names: Vec<&str> = many.iter().map(|(d, _)| d.id.as_str()).collect();
+                    bail!("{} boards in range ({}): pick one with --device NAME", names.len(), names.join(", "))
+                }
+            }
+        }
+    };
+    let bt = emotibit::ble::request(Some(&name), timeout.max(Duration::from_secs(10))).await?;
+    println!("Board: {name}");
+    if dry_run {
+        println!("Dry run: the image looks right and the board answered; nothing was sent.");
+        return Ok(());
+    }
+    if !yes {
+        use std::io::Write;
+        print!("Update {name} over Bluetooth now? The board restarts when done; a recording on it is closed. [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            bail!("not updated");
+        }
+    }
+    let bar = indicatif::ProgressBar::new(app.len() as u64);
+    bar.set_style(
+        indicatif::ProgressStyle::with_template("{bar:40} {bytes}/{total_bytes} {bytes_per_sec}, {eta} left")
+            .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar()),
+    );
+    let started = Instant::now();
+    let result = emotibit::ble::update_firmware(bt, &app, |sent, total| {
+        bar.set_length(total as u64);
+        bar.set_position(sent as u64);
+    })
+    .await;
+    bar.finish_and_clear();
+    let sent = result?;
+    let how = if sent < app.len() { format!(" ({} KB compressed)", sent / 1024) } else { String::new() };
+    println!(
+        "Sent {} KB{how} in {:.0} s; the board checked it and is restarting into it.",
+        app.len() / 1024,
+        started.elapsed().as_secs_f64()
+    );
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if emotibit::ble::scan(Duration::from_secs(8)).await?.iter().any(|(d, _)| d.id == name) {
+            println!("{name} is back.");
+            return Ok(());
+        }
+    }
+    println!("{name} has not come back yet; if it does not, install over USB (emotibit firmware ble).");
+    Ok(())
+}
+
+/// Sends `CR` and waits for the board to drop the link: on a slow connection interval the
+/// command can take a few hundred milliseconds to go out, and disconnecting first would lose it.
+async fn restart_board(handle: &EmotiBitHandle, rx: &mut Receiver<EmotiBitEvent>) -> Result<()> {
+    handle.send_control("CR", &[]).await?;
+    let gone = tokio::time::timeout(Duration::from_secs(12), async {
+        while let Some(ev) = rx.recv().await {
+            if matches!(ev, EmotiBitEvent::Disconnected) {
+                return;
+            }
+        }
+    })
+    .await;
+    match gone {
+        Ok(()) => println!("Restarting the board."),
+        Err(_) => println!("Asked the board to restart; it has not dropped the link yet."),
+    }
+    Ok(())
+}
+
 async fn config_cmd(mut config: EmotiBitClientConfig, action: ConfigAction) -> Result<()> {
+    if let ConfigAction::Profiles = action {
+        print_profiles();
+        return Ok(());
+    }
     if config.transport == Transport::Wifi {
         config.transport = Transport::Ble;
     }
@@ -1050,15 +1195,28 @@ async fn config_cmd(mut config: EmotiBitClientConfig, action: ConfigAction) -> R
     let show = |p: &Packet| {
         let get = |k: &str| p.keyed(k).unwrap_or("");
         println!("{}", describe(handle.device()));
-        println!("  name      {}  (advertised as EmotiBit-BLE-{})", get("name"), get("name"));
-        println!("  ppg_hz    {}", get("ppg_hz"));
-        println!("  leds      {}", if get("leds") == "1" { "on" } else { "off" });
-        println!("  source    {}", get("source"));
+        println!("  {:<15} {}  (advertised as EmotiBit-BLE-{})", "name", get("name"), get("name"));
+        if p.keyed("profile").is_some() {
+            println!("  {:<15} {}", "profile", get("profile"));
+        }
+        println!("  {:<15} {}", "leds", if get("leds") == "1" { "on" } else { "off" });
+        for s in &emotibit::ble::tuning::NUMBERS {
+            let Some(v) = p.keyed(s.key) else { continue };
+            let mut line = format!("  {:<15} {v}{}", s.key, if s.unit.is_empty() { String::new() } else { format!(" {}", s.unit) });
+            if s.key == "cpu_mhz" && !get("cpu_mhz_next").is_empty() && get("cpu_mhz_next") != v {
+                line += &format!("  ({} after a restart)", get("cpu_mhz_next"));
+            }
+            if s.key == "ppg_led" && let Ok(steps) = v.parse::<f64>() {
+                line += &format!("  ({:.1} mA)", steps * 0.2);
+            }
+            println!("{line}");
+        }
+        println!("  {:<15} {}", "source", get("source"));
         if !get("device_id").is_empty() {
-            println!("  device id {}", get("device_id"));
+            println!("  {:<15} {}", "device id", get("device_id"));
         }
         if get("restart_needed") == "1" {
-            println!("  a new name takes effect after a restart (emotibit config restart)");
+            println!("  a new name or CPU clock takes effect after a restart (emotibit config restart)");
         }
     };
     let result = async {
@@ -1095,8 +1253,7 @@ async fn config_cmd(mut config: EmotiBitClientConfig, action: ConfigAction) -> R
                     println!("SD card: {what}");
                 }
                 if restart {
-                    handle.send_control("CR", &[]).await?;
-                    println!("Restarting the board.");
+                    restart_board(&handle, &mut rx).await?;
                 }
             }
             ConfigAction::Clear { store } => {
@@ -1118,10 +1275,8 @@ async fn config_cmd(mut config: EmotiBitClientConfig, action: ConfigAction) -> R
                 }
                 println!("The current settings stay in effect until a restart.");
             }
-            ConfigAction::Restart => {
-                handle.send_control("CR", &[]).await?;
-                println!("Restarting the board.");
-            }
+            ConfigAction::Restart => restart_board(&handle, &mut rx).await?,
+            ConfigAction::Profiles => {}
         }
         anyhow::Ok(())
     }
@@ -1361,7 +1516,7 @@ async fn serve(mut config: EmotiBitClientConfig, opts: ServeOpts) -> Result<()> 
         let logger = match &opts.record_dir {
             Some(dir) => {
                 std::fs::create_dir_all(dir)?;
-                let path = dir.join(format!("{}_{}.csv", handle.device().id, chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")));
+                let path = raw_log_path(dir, &handle.device().id);
                 eprintln!("Logging raw packets to {}", path.display());
                 Some((path.clone(), datafile::spawn_raw_logger(&handle, path).await?))
             }
@@ -1399,7 +1554,7 @@ async fn serve(mut config: EmotiBitClientConfig, opts: ServeOpts) -> Result<()> 
         if let Some((path, task)) = logger
             && let Ok(Ok(lines)) = task.await {
                 eprintln!("Logged {lines} packets. Converting...");
-                match datafile::parse_file(&path, path.parent()) {
+                match datafile::parse_file(&path, path.parent(), gzip()) {
                     Ok(r) => report(&r, ""),
                     Err(e) => eprintln!("conversion failed: {e:#}"),
                 }

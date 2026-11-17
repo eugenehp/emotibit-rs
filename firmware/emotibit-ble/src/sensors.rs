@@ -20,8 +20,11 @@ pub static RESYNC: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::
 pub static BYTES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Records dropped because the queue was full (the link could not keep up).
 pub static DROPPED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// Records for the BLE link, with the device milliseconds they were taken.
-pub static QUEUE: Channel<CriticalSectionRawMutex, (u32, Packet), 96> = Channel::new();
+/// Records for the BLE link, with the device milliseconds they were taken. About 1.9 s at the
+/// full rate (133 records/s), so a slow connection interval (120 ms in `low_energy`) can miss a
+/// few connection events without dropping records; 96 (0.7 s) dropped some. Static RAM is also
+/// the main stack, so not more.
+pub static QUEUE: Channel<CriticalSectionRawMutex, (u32, Packet), 256> = Channel::new();
 
 /// Channel tags, shared with `emotibit::ble::tag`.
 pub mod tag {
@@ -154,8 +157,9 @@ const TEMP1_PERIOD: Duration = Duration::from_millis(133);
 const TEMP1_MAX_JUMP: i32 = 5000;
 
 /// PPG at 25 Hz (stock: 400 sps averaged by 16, 215 us pulses) or 100 Hz (stock's PPG-100
-/// variant: 800 sps averaged by 8, 118 us pulses).
-async fn ppg_init<I: I2c>(i2c: &mut I, hz: u8) -> bool {
+/// variant: 800 sps averaged by 8, 118 us pulses). `led`: each LED's current in 0.2 mA steps
+/// (stock 0x2F, 9.4 mA).
+async fn ppg_init<I: I2c>(i2c: &mut I, hz: u8, led: u8) -> bool {
     let mut id = [0u8];
     if i2c.write_read(PPG, &[0xFF], &mut id).await.is_err() || id[0] != 0x15 {
         return false;
@@ -166,9 +170,9 @@ async fn ppg_init<I: I2c>(i2c: &mut I, hz: u8) -> bool {
     let (fifo, spo2) = if hz == 100 { (0x7F, 0x31) } else { (0x9F, 0x2E) };
     let _ = i2c.write(PPG, &w(0x08, fifo)).await; // averaging, rollover, almost-full 15
     let _ = i2c.write(PPG, &w(0x0A, spo2)).await; // 4096 nA range, sample rate, pulse width
-    let _ = i2c.write(PPG, &w(0x0C, 0x2F)).await; // red LED current
-    let _ = i2c.write(PPG, &w(0x0D, 0x2F)).await; // IR LED current
-    let _ = i2c.write(PPG, &w(0x0E, 0x2F)).await; // green LED current
+    let _ = i2c.write(PPG, &w(0x0C, led)).await; // red LED current
+    let _ = i2c.write(PPG, &w(0x0D, led)).await; // IR LED current
+    let _ = i2c.write(PPG, &w(0x0E, led)).await; // green LED current
     let _ = i2c.write(PPG, &w(0x11, 0x21)).await; // slot1 red, slot2 IR
     let _ = i2c.write(PPG, &w(0x12, 0x03)).await; // slot3 green
     let _ = i2c.write(PPG, &w(0x04, 0x00)).await; // clear FIFO pointers
@@ -488,6 +492,7 @@ pub struct Found {
 /// stock hardware-version number from the EEPROM, which picks the LED driver's address.
 pub async fn run<I: I2c, B: FnMut() -> Option<(u16, u32)>>(mut i2c: I, mut read_battery: B, board: crate::control::Board, hw_version: Option<u8>) -> ! {
     use crate::control::{self, found as bit};
+    use crate::tuning::n;
     use core::sync::atomic::Ordering::Relaxed;
     let mut seq = Seq([0; NTAGS]);
     let eda = ads_start(&mut i2c).await;
@@ -497,16 +502,16 @@ pub async fn run<I: I2c, B: FnMut() -> Option<(u16, u32)>>(mut i2c: I, mut read_
     let found = Found {
         eda,
         imu,
-        ppg: ppg_init(&mut i2c, board.ppg_hz).await,
+        ppg: ppg_init(&mut i2c, board.ppg_hz(), board.get(n::PPG_LED) as u8).await,
         mag: mag_trim.is_some(),
         thermopile: mlx_cal.is_some(),
         si7013: si_init(&mut i2c).await,
     };
     // Set up even when the settings turn LEDs off: they can be turned on over Bluetooth.
-    let mut leds = crate::board::LedDriver::new(&mut i2c, hw_version).await;
+    let mut leds = crate::board::LedDriver::new(&mut i2c, hw_version, board.get(n::LED_BRIGHTNESS) as u8).await;
     log::info!(
         "sensors: eda={} imu={} ppg={} ({} Hz) mag={} thermopile={} si7013={} leds={}",
-        found.eda, found.imu, found.ppg, board.ppg_hz, found.mag, found.thermopile, found.si7013, leds.is_some()
+        found.eda, found.imu, found.ppg, board.ppg_hz(), found.mag, found.thermopile, found.si7013, leds.is_some()
     );
     let bits = [
         (found.eda, bit::EDA),
@@ -539,15 +544,29 @@ pub async fn run<I: I2c, B: FnMut() -> Option<(u16, u32)>>(mut i2c: I, mut read_
     let mut si_due = Instant::now();
     let mut si_read_at: Option<Instant> = None;
     let mut tick = 0u32;
+    // Wakes every `sensor_ms` (`CS,sensor_ms`): EDA is read every 4 ms or the first wake after,
+    // the IMU, PPG and thermopile every 10 ms or the first wake after, each on its own wake.
+    let mut interval = 0u8;
     let mut ticker = Ticker::every(Duration::from_millis(2));
+    let (mut eda_every, mut every) = (1u32, 1u32);
 
     let mut eda_due = Instant::now() + EDA_PERIOD;
     loop {
+        let ms = control::SENSOR_INTERVAL.load(Relaxed);
+        if ms != interval {
+            interval = ms;
+            ticker = Ticker::every(Duration::from_millis(ms as u64));
+            eda_every = 4u32.div_ceil(ms as u32);
+            every = 10u32.div_ceil(ms as u32);
+            log::info!("sensors: waking every {} ms", ms);
+        }
         tick = tick.wrapping_add(1);
-        // EDA: continuous 250 SPS, read every 4 ms and averaged over 64 ms windows -> 15.625 Hz.
-        // The window is timed rather than counted: while the radio is busy the loop runs
-        // slower and fewer conversions land in a window, but the rate stays the same.
-        if found.eda && tick.is_multiple_of(2)
+        let on = |phase: u32| tick % every == phase % every;
+        // EDA: continuous 250 SPS, read every 4 ms (or less often, see above) and averaged over
+        // 64 ms windows -> 15.625 Hz. The window is timed rather than counted: while the radio
+        // is busy the loop runs slower and fewer conversions land in a window, but the rate
+        // stays the same.
+        if found.eda && tick.is_multiple_of(eda_every)
             && let Some(v) = ads_read(&mut i2c).await {
                 eda_sum += v as i32;
                 eda_n += 1;
@@ -568,7 +587,7 @@ pub async fn run<I: I2c, B: FnMut() -> Option<(u16, u32)>>(mut i2c: I, mut read_
             eda_n = 0;
         }
         // IMU: the chip's data-ready flags avoid duplicates at 25 Hz.
-        if found.imu && tick % 5 == 1 {
+        if found.imu && on(1) {
             let mut st = [0u8];
             if i2c.write_read(BMI, &[0x1B], &mut st).await.is_ok() {
                 // Read each stream on its own data-ready flag so none is skipped or repeated.
@@ -606,7 +625,7 @@ pub async fn run<I: I2c, B: FnMut() -> Option<(u16, u32)>>(mut i2c: I, mut read_
                 }
             }
         }
-        if found.ppg && tick % 5 == 3 {
+        if found.ppg && on(3) {
             ppg_drain(&mut i2c, &mut seq).await;
         }
         if found.ppg {
@@ -636,7 +655,7 @@ pub async fn run<I: I2c, B: FnMut() -> Option<(u16, u32)>>(mut i2c: I, mut read_
                 }
             }
         }
-        if found.thermopile && tick % 5 == 4
+        if found.thermopile && on(4)
             && let Some(raw) = mlx_poll(&mut i2c).await {
                 seq.send(tag::THERMOPILE_RAW, &raw);
                 mlx_same = if raw == mlx_last { mlx_same.saturating_add(1) } else { 0 };
@@ -681,7 +700,7 @@ pub async fn run<I: I2c, B: FnMut() -> Option<(u16, u32)>>(mut i2c: I, mut read_
                     seq.send(tag::MAG_CAL, &[i as i32, *v]);
                 }
             }
-            seq.send(tag::INFO, &[control::board().ppg_hz as i32]);
+            seq.send(tag::INFO, &[control::board().ppg_hz() as i32]);
         }
         if Instant::now() >= next_batt {
             next_batt = Instant::now() + Duration::from_secs(5);
@@ -698,6 +717,8 @@ pub async fn run<I: I2c, B: FnMut() -> Option<(u16, u32)>>(mut i2c: I, mut read_
             let now = Instant::now();
             if now >= led_due {
                 led_due = now + Duration::from_millis(50);
+                let settings = control::board();
+                d.set_brightness(&mut i2c, settings.get(n::LED_BRIGHTNESS) as u8).await;
                 let pct = control::BATTERY_PERCENT.load(Relaxed);
                 if pct != 255 {
                     low_battery = if low_battery { pct <= 50 } else { pct < 20 };
@@ -712,7 +733,7 @@ pub async fn run<I: I2c, B: FnMut() -> Option<(u16, u32)>>(mut i2c: I, mut read_
                 }
                 let radio_on = !matches!(control::power(), control::Power::WirelessOff | control::Power::Hibernate);
                 let blink = now.as_millis() % 500 < 125;
-                let state = if !control::board().leds {
+                let state = if !settings.leds {
                     crate::board::Leds::default()
                 } else if control::BUTTON_HELD.load(Relaxed) {
                     crate::board::Leds { red: true, blue: true, yellow: true }
@@ -734,11 +755,13 @@ pub async fn run<I: I2c, B: FnMut() -> Option<(u16, u32)>>(mut i2c: I, mut read_
             report_due += Duration::from_secs(1);
             control::report_clipping_and_overflow();
         }
-        // PPG rate changed over Bluetooth: set the chip up again, and tell the host at once.
+        // PPG rate or LED current changed over Bluetooth: set the chip up again, and tell the
+        // host at once.
         if control::PPG_CHANGED.swap(false, Relaxed) && found.ppg {
-            let hz = control::board().ppg_hz;
-            ppg_init(&mut i2c, hz).await;
-            log::info!("PPG now {} Hz", hz);
+            let b = control::board();
+            let (hz, led) = (b.ppg_hz(), b.get(n::PPG_LED) as u8);
+            ppg_init(&mut i2c, hz, led).await;
+            log::info!("PPG now {} Hz, LEDs {}.{} mA", hz, led as u32 * 2 / 10, led as u32 * 2 % 10);
             cal_due = Instant::now();
         }
         if control::SELF_TEST.swap(false, Relaxed) {

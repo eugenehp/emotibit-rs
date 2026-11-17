@@ -11,9 +11,12 @@
 //! | `stock` | the official installer's four parts (bootloader@0x1000, partitions@0x8000, boot_app0@0xe000, app@0x10000) |
 //! | `write` | any image: merged (at 0), app (at 0x10000), partition table (at 0x8000), or `FILE@ADDRESS` |
 //! | `restore` | a `backup` file, all of it, at 0 |
+//! | `ota` | `emotibit-ble` over Bluetooth, no USB (`emotibit firmware ota`; the app part only) |
 //!
 //! `ble` and `stock` keep the board's settings partition (`nvs`) when the partition table stays
-//! the same, and erase it when the table changes, so neither firmware finds the other's data.
+//! the same, and erase it when the table changes, so neither firmware finds the other's data
+//! (`ble` keeps it across emotibit-ble's own table change, which added update slots). When the
+//! table has update slots, `ble` also resets which slot starts, so the board runs what it wrote.
 //! The Feather M0 is not supported (it is flashed with `bossac`).
 
 use std::borrow::Cow;
@@ -102,6 +105,20 @@ pub enum FirmwareCommand {
         #[command(flatten)]
         target: Target,
     },
+    /// Update the emotibit-ble firmware over Bluetooth, without USB (pick the board with
+    /// `emotibit --device NAME`). Needs emotibit-ble 0.1.1 or later on the board (with update
+    /// slots), installed over USB once with `firmware ble`
+    Ota {
+        /// An emotibit-ble image (merged, or the app alone) instead of the one built in
+        #[arg(long)]
+        image: Option<PathBuf>,
+        /// Check the image and find the board, without updating it
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not ask before updating
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 #[derive(Args, Clone)]
@@ -135,6 +152,7 @@ pub fn run(cmd: FirmwareCommand) -> Result<()> {
         FirmwareCommand::Stock { firmware_dir, app, target } => stock(firmware_dir.as_deref(), app.as_deref(), &target),
         FirmwareCommand::Write { images, target } => write_any(&images, &target),
         FirmwareCommand::Restore { file, target } => restore(&file, &target),
+        FirmwareCommand::Ota { .. } => bail!("updates over Bluetooth are `emotibit firmware ota`"),
     }
 }
 
@@ -329,6 +347,8 @@ struct Plan {
     /// The partition table this plan installs, if any: the board's settings partition is erased
     /// when the board has a different one.
     table: Option<Vec<Partition>>,
+    /// emotibit-ble: its settings are kept across its own table changes.
+    ble: bool,
 }
 
 /// The bootloader, partition table and app partitions of a merged image; its data partitions
@@ -382,6 +402,21 @@ fn info(port: &PortArgs) -> Result<()> {
             None => "empty".into(),
         };
         println!("Firmware in {}: {what}", p.label);
+    }
+    // With update slots: the one otadata selects (the higher of its two sequence numbers).
+    let slots: Vec<&Partition> = table.iter().filter(|p| p.kind == 0 && (0x10..=0x1f).contains(&p.subtype)).collect();
+    if let Some(ota) = table.iter().find(|p| p.kind == 1 && p.subtype == 0x00)
+        && !slots.is_empty()
+    {
+        let data = read(&mut flasher, ota.offset, 0x2000)?;
+        let seq = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+        let best = [seq(0), seq(0x1000)].into_iter().filter(|&s| s != u32::MAX && s != 0).max();
+        let starts = match best {
+            // The bootloader also writes it, for the first slot, when it finds it empty.
+            Some(s) => slots.iter().find(|p| p.subtype == 0x10 + ((s - 1) % slots.len() as u32) as u8).map_or("?".into(), |p| p.label.clone()),
+            None => format!("{} ({} is empty)", slots[0].label, ota.label),
+        };
+        println!("Starts:      {starts}");
     }
     restart(flasher)
 }
@@ -437,7 +472,26 @@ fn ble(image: Option<&Path>, target: &Target) -> Result<()> {
     if let Some(d) = parts.iter().find(|p| p.name.starts_with("app")).and_then(|p| app_desc(&p.data)) {
         println!("Image: {what}: {}", firmware_name(&d));
     }
-    execute(Plan { title: "emotibit-ble firmware".into(), parts, table: Some(table) }, target)
+    execute(Plan { title: "emotibit-ble firmware".into(), parts, table: Some(table), ble: true }, target)
+}
+
+/// The emotibit-ble app image for an update over Bluetooth (`--image`, merged or the app alone,
+/// or the one built in), and what it is in words.
+pub fn ota_image(image: Option<&Path>) -> Result<(Vec<u8>, String)> {
+    let (data, what) = ble_image(image)?;
+    let app = if is_merged(&data) {
+        let (parts, _) = split_merged(&data, &what)?;
+        parts.into_iter().find(|p| p.name.starts_with("app")).map(|p| p.data).context("no app in the image")?
+    } else if is_esp_image(&data) {
+        trim_erased(&data).to_vec()
+    } else {
+        bail!("{what} is neither a merged image nor an app image");
+    };
+    match app_desc(&app) {
+        Some(d) if d.project == "emotibit-ble" => Ok((app, format!("{what}: {}", firmware_name(&d)))),
+        Some(d) => bail!("{what} holds {}, not emotibit-ble; only emotibit-ble updates over Bluetooth", firmware_name(&d)),
+        None => bail!("{what} has no app descriptor; only emotibit-ble updates over Bluetooth"),
+    }
 }
 
 /// The directory holding `esp32/boot_app0.bin` at or below `root` (the installer's Resources).
@@ -494,7 +548,7 @@ fn stock(firmware_dir: Option<&Path>, app: Option<&Path>, target: &Target) -> Re
         Part { name: app_name, addr: APP_AT, data: app_data },
     ];
     println!("Installer files: {}", dir.display());
-    execute(Plan { title: "stock EmotiBit firmware".into(), parts, table: Some(partitions(&table)) }, target)
+    execute(Plan { title: "stock EmotiBit firmware".into(), parts, table: Some(partitions(&table)), ble: false }, target)
 }
 
 /// `FILE` or `FILE@ADDRESS` (hex with 0x, or decimal).
@@ -529,7 +583,7 @@ fn parse_image_arg(arg: &str) -> Result<Part> {
 
 fn write_any(images: &[String], target: &Target) -> Result<()> {
     let parts = images.iter().map(|a| parse_image_arg(a)).collect::<Result<Vec<_>>>()?;
-    execute(Plan { title: "images".into(), parts, table: None }, target)
+    execute(Plan { title: "images".into(), parts, table: None, ble: false }, target)
 }
 
 fn restore(file: &Path, target: &Target) -> Result<()> {
@@ -538,7 +592,7 @@ fn restore(file: &Path, target: &Target) -> Result<()> {
         bail!("{} is not a full flash image (no bootloader at 0x1000 and partition table at 0x8000)", file.display());
     }
     let parts = vec![Part { name: format!("{} (all of it)", file.display()), addr: 0, data }];
-    execute(Plan { title: "a full flash image".into(), parts, table: None }, target)
+    execute(Plan { title: "a full flash image".into(), parts, table: None, ble: false }, target)
 }
 
 // ── Writing ──────────────────────────────────────────────────────────────────
@@ -629,13 +683,32 @@ fn execute(mut plan: Plan, target: &Target) -> Result<()> {
         bail!("the images end at 0x{end:x}, past the board's {} flash", info.flash_size);
     }
 
-    // A different partition table: the settings partition holds another firmware's data.
+    // A different partition table: the settings partition holds another firmware's data,
+    // unless the board already runs emotibit-ble and its settings stay where they were.
     if let Some(new) = &plan.table {
         let old = partitions(&read(&mut flasher, PARTITIONS_AT, 0x1000)?);
         if &old != new {
+            let mut was_ble = false;
+            for p in old.iter().filter(|p| p.is_app()) {
+                was_ble |= app_desc(&read(&mut flasher, p.offset, 0x100)?).is_some_and(|d| d.project == "emotibit-ble");
+            }
             for p in new.iter().filter(|p| p.kind == 1 && p.subtype == 0x02) {
+                let same_place = old.iter().any(|o| o.kind == 1 && o.subtype == 0x02 && o.offset == p.offset);
+                if plan.ble && was_ble && same_place {
+                    println!("New partition table: keeping the emotibit-ble settings in {} (0x{:x})", p.label, p.offset);
+                    continue;
+                }
                 println!("New partition table: erasing {} (0x{:x}, {} KB)", p.label, p.offset, p.size / 1024);
                 flasher.erase_region(p.offset, p.size).context("erasing the settings partition failed")?;
+            }
+        }
+        // Which update slot starts: reset, so the board runs the app written now (the first
+        // slot), not one an earlier update over Bluetooth selected. Not when a part writes it
+        // (the stock installer's boot_app0).
+        for p in new.iter().filter(|p| p.kind == 1 && p.subtype == 0x00) {
+            if !plan.parts.iter().any(|w| w.addr >= p.offset && w.addr < p.offset + p.size) {
+                println!("Resetting {} (which app slot starts)", p.label);
+                flasher.erase_region(p.offset, p.size).context("erasing otadata failed")?;
             }
         }
     }

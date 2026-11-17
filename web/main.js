@@ -446,14 +446,33 @@ $('settings-btn').onclick = () => {
   if (!panel.hidden) { $('set-info').textContent = 'Reading the board’s settings…'; lastSettings = ''; bleSend('CG'); }
 };
 let lastSettings = '';
+// Numeric settings in the panel (ids set-<key>), and the board's last answer.
+const NUMS = ['led_brightness', 'cpu_mhz', 'sensor_ms', 'conn_ms', 'adv_ms', 'tx_dbm', 'ppg_led'];
+let shown = {};
 function saveSettings(restart) {
   const name = $('set-name').value.trim();
   if (!/^[A-Za-z0-9_-]{0,9}$/.test(name)) { $('set-info').textContent = 'Name: up to 9 letters, digits, - or _ (empty: the serial number).'; return; }
-  bleSend('CS', ['name', name, 'ppg_hz', $('set-ppg').value, 'leds', $('set-leds').checked ? '1' : '0', 'store', $('set-store').value]);
+  // A profile picked here sets everything; otherwise only what was changed is sent, so the
+  // board keeps matching its profile where it can.
+  const args = ['name', name];
+  const profile = $('set-profile').value;
+  if (profile !== 'custom' && profile !== shown.profile) args.push('profile', profile);
+  else {
+    const leds = $('set-leds').checked ? '1' : '0';
+    if ($('set-ppg').value !== shown.ppg_hz) args.push('ppg_hz', $('set-ppg').value);
+    if (leds !== shown.leds) args.push('leds', leds);
+    for (const k of NUMS) {
+      const v = $(`set-${k}`).value;
+      if (shown[k] !== undefined && v !== '' && v !== shown[k]) args.push(k, v);
+    }
+  }
+  bleSend('CS', [...args, 'store', $('set-store').value]);
   if (restart) { bleSend('CR'); $('set-info').textContent = 'Saved; the board restarts and the page reconnects.'; }
 }
 $('set-save').onclick = () => saveSettings(false);
 $('set-restart').onclick = () => saveSettings(true);
+// Editing a setting by hand leaves the profile.
+for (const id of ['set-ppg', 'set-leds', ...NUMS.map((k) => `set-${k}`)]) $(id).addEventListener('input', () => { $('set-profile').value = 'custom'; });
 setInterval(() => {
   if (source !== 'ble' || $('settings').hidden) return;
   const reply = scope.ble_settings_reply();
@@ -467,8 +486,17 @@ setInterval(() => {
   const serial = (c.device_id ?? '').split('-').pop();
   $('set-name').value = c.name === serial ? '' : c.name;
   $('set-ppg').value = c.ppg_hz; $('set-leds').checked = c.leds === '1';
+  shown = { ppg_hz: c.ppg_hz, leds: c.leds ?? '1', profile: c.profile ?? 'custom' };
+  // The clock it starts with next, so a pending change shows.
+  for (const k of NUMS) {
+    const v = k === 'cpu_mhz' ? c.cpu_mhz_next ?? c[k] : c[k];
+    $(`set-${k}`).value = v ?? '';
+    $(`set-${k}`).disabled = v === undefined; // firmware without the setting
+    shown[k] = v;
+  }
+  $('set-profile').value = shown.profile;
   const from = { default: 'defaults', flash: 'set over Bluetooth', card: 'the SD card’s CONFIG.TXT (it overrides these at boot)' }[c.source] ?? c.source;
-  $('set-info').textContent = `${c.device_id || 'no device id'} · settings from ${from}` + (c.restart_needed === '1' ? ' · the new name shows after a restart' : '') + (reply.startsWith('ok') ? ' · saved' : '');
+  $('set-info').textContent = `${c.device_id || 'no device id'} · settings from ${from}` + (c.restart_needed === '1' ? ' · a new name or CPU clock applies after a restart' : '') + (reply.startsWith('ok') ? ' · saved' : '');
 }, 300);
 $('rec-btn').onclick = () => {
   if (source === 'bridge') { send({ cmd: sdRecording ? 'record_end' : 'record_begin' }); return; }

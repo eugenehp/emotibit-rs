@@ -1,0 +1,8 @@
+# emotibit-ble partition table: two app slots for updates over Bluetooth (`emotibit firmware ota`).
+# The board runs one slot and an update goes into the other; `otadata` says which one boots.
+# Settings live in the first sector of `nvs` (see src/settings.rs).
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+ota_0,    app,  ota_0,   0x10000,  0x1f0000,
+ota_1,    app,  ota_1,   0x200000, 0x1f0000,

@@ -185,7 +185,15 @@
 <div id="settings" hidden>
   <label class="group">Name <span class="muted mono">EmotiBit-BLE-</span><input id="set-name" type="text" maxlength="9" spellcheck="false" class="mono" placeholder="serial"></label>
   <label class="group">PPG <select id="set-ppg"><option value="25">25 Hz</option><option value="100">100 Hz</option></select></label>
+  <label class="group">Profile <select id="set-profile"><option value="custom">custom</option><option>default</option><option>high_frequency</option><option>low_noise</option><option>balanced</option><option>energy_saving</option><option>low_energy</option></select></label>
   <label class="group"><input id="set-leds" type="checkbox"> status LEDs</label>
+  <label class="group">brightness <input id="set-led_brightness" class="num" type="number" min="1" max="31"></label>
+  <label class="group">CPU <select id="set-cpu_mhz"><option>80</option><option>160</option><option>240</option></select> MHz</label>
+  <label class="group">sensors every <input id="set-sensor_ms" class="num" type="number" min="2" max="20"> ms</label>
+  <label class="group">link interval <input id="set-conn_ms" class="num" type="number" min="15" max="500"> ms</label>
+  <label class="group">advertising <input id="set-adv_ms" class="num" type="number" min="20" max="10240"> ms</label>
+  <label class="group">transmit <select id="set-tx_dbm"><option>-12</option><option>-9</option><option>-6</option><option>-3</option><option>0</option><option>3</option><option>6</option><option>9</option></select> dBm</label>
+  <label class="group">PPG LEDs <input id="set-ppg_led" class="num" type="number" min="1" max="255"> &times; 0.2 mA</label>
   <label class="group" title="Flash: the board's own memory. SD card: CONFIG.TXT, which wins at boot (the rest of the file is kept; the original is saved as CONFIG.BAK).">Keep in <select id="set-store"><option value="flash">flash</option><option value="sd">SD card</option><option value="both">both</option></select></label>
   <button id="set-save">Save</button>
   <button id="set-restart" title="Save and restart the board (a new name needs it)">Save &amp; restart</button>

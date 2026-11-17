@@ -20,7 +20,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 command -v wasm-pack >/dev/null || { echo "error: wasm-pack is required (cargo install wasm-pack)" >&2; exit 1; }
-wasm-pack build --target web --release --out-dir web/pkg --out-name emotibit -- --no-default-features --features webscope
+# The `web` profile's settings (wasm-pack builds `release`); wasm-opt -Oz runs after (Cargo.toml).
+CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_OPT_LEVEL=z \
+  CARGO_PROFILE_RELEASE_PANIC=abort CARGO_PROFILE_RELEASE_STRIP=true \
+  wasm-pack build --target web --release --out-dir web/pkg --out-name emotibit -- --no-default-features --features webscope
 rm -f web/pkg/.gitignore web/pkg/package.json web/pkg/README.md
 
 if [[ -n "$static_dir" ]]; then

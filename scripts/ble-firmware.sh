@@ -22,7 +22,8 @@ command -v espflash >/dev/null || { echo "espflash not found: cargo install espf
 
 (cd firmware/emotibit-ble && cargo build --release)
 ELF=firmware/emotibit-ble/target/xtensa-esp32-none-elf/release/emotibit-ble
-espflash save-image --chip esp32 --merge "$ELF" firmware/emotibit-ble.bin >/dev/null
+# Unpadded: the 4 MB of flash past the app is erased 0xFF anyway (an install writes what is here).
+espflash save-image --chip esp32 --merge --skip-padding --partition-table firmware/emotibit-ble/partitions.csv "$ELF" firmware/emotibit-ble.bin >/dev/null
 echo "image: firmware/emotibit-ble.bin"
 
 if [[ "${1:-}" == flash ]]; then

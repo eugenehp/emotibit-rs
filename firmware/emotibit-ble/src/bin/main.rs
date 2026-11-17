@@ -17,7 +17,7 @@
 
 use bt_hci::controller::ExternalController;
 use embassy_executor::Spawner;
-use embassy_futures::{join::join5, select::{select, select4, Either}};
+use embassy_futures::{join::join5, select::{select, select3, select4, Either, Either3}};
 use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::analog::adc::{Adc, AdcConfig, Attenuation};
@@ -27,6 +27,7 @@ use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_radio::ble::controller::BleConnector;
 use emotibit_ble::control::{self, Power};
+use emotibit_ble::tuning::{self, n};
 use emotibit_ble::{adc_cal, sdcard, sensors};
 use log::{info, warn};
 use static_cell::{ConstStaticCell, StaticCell};
@@ -40,7 +41,7 @@ const MAX_VALUE: usize = 500;
 const MAX_CONTROL: usize = 500;
 const CONNECTIONS_MAX: usize = 1;
 /// Bump when characteristics are added or changed (see the address below).
-const GATT_LAYOUT: u8 = 3;
+const GATT_LAYOUT: u8 = 5;
 const L2CAP_CHANNELS_MAX: usize = 2;
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -65,6 +66,10 @@ struct EmotiBitService {
     /// Device status and time sync: stock packet lines (notify).
     #[characteristic(uuid = "6e6f7469-6269-7400-0000-000000000005", notify)]
     events: heapless::Vec<u8, 480>,
+    /// Firmware update: begin, data, end (see `ota`); answers on the events characteristic.
+    /// Data may come without response, a window at a time (see `ota`).
+    #[characteristic(uuid = "6e6f7469-6269-7400-0000-000000000006", write, write_without_response)]
+    update: heapless::Vec<u8, { emotibit_ble::ota::MAX_WRITE }>,
 }
 
 /// The SD card's SPI bus. `embedded-sdmmc` makes one SPI transaction per byte, and a chip
@@ -113,8 +118,17 @@ async fn sd_task(mut spi: SdSpi, mut cs: Output<'static>) {
 async fn main(_spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
 
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    // The CPU clock is set here, before anything else runs, so it comes from flash (`CS,cpu_mhz`);
+    // a different one in CONFIG.TXT is copied there below and applies from the next start.
+    let cpu_mhz = emotibit_ble::settings::early_cpu_mhz().or(tuning::NUMBERS[n::CPU_MHZ].default).unwrap_or(240);
+    let cpu_clock = match cpu_mhz {
+        80 => CpuClock::_80MHz,
+        160 => CpuClock::_160MHz,
+        _ => CpuClock::_240MHz,
+    };
+    let config = esp_hal::Config::default().with_cpu_clock(cpu_clock);
     let peripherals = esp_hal::init(config);
+    info!("CPU {} MHz", cpu_mhz);
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 98768);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
@@ -191,6 +205,7 @@ async fn main(_spawner: Spawner) -> ! {
     let identity = emotibit_ble::board::identity(&mut i2c).await;
     // Settings: CONFIG.TXT on the card wins, then what was set over Bluetooth (flash).
     let mut flash = esp_storage::FlashStorage::new(peripherals.FLASH).multicore_auto_park();
+    emotibit_ble::ota::confirm(&mut flash);
     let stored = emotibit_ble::settings::load(&mut flash);
     let deadline = embassy_time::Instant::now() + Duration::from_secs(4);
     while !control::CONFIG_DONE.load(core::sync::atomic::Ordering::Relaxed) && embassy_time::Instant::now() < deadline {
@@ -202,7 +217,16 @@ async fn main(_spawner: Spawner) -> ! {
         (None, Some(c)) => (c, control::Source::Flash),
         (None, None) => (control::Config::default(), control::Source::Default),
     };
-    control::STORED.lock(|s| *s.borrow_mut() = (stored.unwrap_or_default(), source, false));
+    // A CPU clock from the card that flash doesn't have yet: keep it there for the next start.
+    let mut stored = stored.unwrap_or_default();
+    let card_cpu = config.values[n::CPU_MHZ];
+    let cpu_pending = card_cpu.is_some_and(|c| c != cpu_mhz);
+    if source == control::Source::Card && card_cpu.is_some() && card_cpu != stored.values[n::CPU_MHZ] {
+        stored.values[n::CPU_MHZ] = card_cpu;
+        let _ = control::SAVE.try_send(Some(stored));
+        info!("settings: CPU clock {} MHz from CONFIG.TXT kept in flash for the next start", card_cpu.unwrap_or(0));
+    }
+    control::STORED.lock(|s| *s.borrow_mut() = (stored, source, cpu_pending));
     let board = {
         use core::fmt::Write as _;
         let mut b = control::Board::new();
@@ -228,8 +252,9 @@ async fn main(_spawner: Spawner) -> ! {
             }
             None => b.name = b.default_name,
         }
-        b.ppg_hz = config.ppg_hz.unwrap_or(25);
-        b.leds = config.leds.unwrap_or(true);
+        b.apply(&config);
+        b.values[n::CPU_MHZ] = Some(cpu_mhz);
+        control::SENSOR_INTERVAL.store(b.get(n::SENSOR_MS) as u8, core::sync::atomic::Ordering::Relaxed);
         control::BOARD.lock(|cell| *cell.borrow_mut() = b.clone());
         b
     };
@@ -263,6 +288,12 @@ async fn main(_spawner: Spawner) -> ! {
     .unwrap();
 
     let radio = async {
+        // Transmit power: the controller is up now.
+        emotibit_ble::radio::init();
+        if board.values[n::TX_DBM].is_some() && !emotibit_ble::radio::set_tx_dbm(board.values[n::TX_DBM]) {
+            warn!("settings: the radio refused transmit power {:?} dBm", board.values[n::TX_DBM]);
+        }
+        info!("transmit power {} dBm", emotibit_ble::radio::tx_dbm());
         loop {
             // Wireless off: no advertising until a button press (or hibernate).
             while matches!(control::power(), Power::WirelessOff | Power::Hibernate) {
@@ -277,9 +308,15 @@ async fn main(_spawner: Spawner) -> ! {
                 &mut adv_data[..],
             )
             .unwrap();
+            let adv_ms = control::board().get(n::ADV_MS);
+            let params = AdvertisementParameters {
+                interval_min: Duration::from_millis(adv_ms as u64),
+                interval_max: Duration::from_millis(adv_ms as u64),
+                ..Default::default()
+            };
             let advertiser = match peripheral
                 .advertise(
-                    &Default::default(),
+                    &params,
                     Advertisement::ConnectableScannableUndirected { adv_data: &adv_data[..len], scan_data: &[] },
                 )
                 .await
@@ -291,9 +328,10 @@ async fn main(_spawner: Spawner) -> ! {
                     continue;
                 }
             };
-            // Stop advertising if the power mode turns the radio off meanwhile.
+            // Stop advertising if the power mode turns the radio off meanwhile, or start again
+            // with a new interval.
             let accepted = select(advertiser.accept(), async {
-                while !matches!(control::power(), Power::WirelessOff | Power::Hibernate) {
+                while !matches!(control::power(), Power::WirelessOff | Power::Hibernate) && control::board().get(n::ADV_MS) == adv_ms {
                     Timer::after(Duration::from_millis(100)).await;
                 }
             })
@@ -365,17 +403,26 @@ async fn main(_spawner: Spawner) -> ! {
         lpwr.sleep_deep(esp_hal::rtc_cntl::sleep::RtcSleepConfig::deep())
     };
 
-    // Saves settings set over Bluetooth; restarts on request (`CR`).
+    // Saves settings set over Bluetooth, writes firmware updates; restarts on request (`CR`) or
+    // after an update.
     let settings = async {
+        let mut updater = emotibit_ble::ota::Updater::default();
         loop {
-            match select(control::SAVE.receive(), async {
+            match select3(control::SAVE.receive(), emotibit_ble::ota::IN.receive(), async {
                 while !control::RESTART.load(core::sync::atomic::Ordering::Relaxed) {
                     Timer::after(Duration::from_millis(100)).await;
                 }
             })
             .await
             {
-                Either::First(cfg) => {
+                Either3::Second(write) => {
+                    if updater.handle(&mut flash, &write) {
+                        // Let the `OT,done` line go out first.
+                        Timer::after(Duration::from_millis(500)).await;
+                        control::RESTART.store(true, core::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                Either3::First(cfg) => {
                     let result = match &cfg {
                         Some(c) => emotibit_ble::settings::save(&mut flash, c),
                         None => emotibit_ble::settings::clear(&mut flash),
@@ -385,7 +432,7 @@ async fn main(_spawner: Spawner) -> ! {
                         Err(e) => warn!("settings: flash write failed ({:?})", e),
                     }
                 }
-                Either::Second(()) => {
+                Either3::Third(()) => {
                     info!("restart requested");
                     let _ = control::SD_CMD.try_send(control::SdCmd::End);
                     Timer::after(Duration::from_millis(1500)).await;
@@ -440,6 +487,10 @@ async fn session(
                         } else if w.handle() == server.emotibit.control.handle
                             && let Ok(bytes) = w.value(&server.emotibit.control) {
                                 control::handle(&bytes);
+                            } else if w.handle() == server.emotibit.update.handle {
+                                // Waits while the flash task is busy: the write's response then
+                                // waits too, which paces the host.
+                                emotibit_ble::ota::IN.send(w.with_data(|_, d| d.to_vec())).await;
                             }
                     }
                     if let Ok(reply) = event.accept() {
@@ -469,11 +520,13 @@ async fn session(
     // max >= min + 15 ms); in max-low power a slow one. The central may refuse either. Ends the
     // session when the power mode turns the radio off.
     let tune = async {
+        const SETTLE: Duration = Duration::from_secs(5);
+        let started = Instant::now();
         Timer::after(Duration::from_millis(500)).await;
         if let Err(e) = conn.raw().update_data_length(stack, 251, 2120).await {
             warn!("data length request: {:?}", e);
         }
-        let mut applied: Option<bool> = None;
+        let mut applied: Option<u64> = None;
         loop {
             let power = control::power();
             if matches!(power, Power::WirelessOff | Power::Hibernate) {
@@ -484,10 +537,23 @@ async fn session(
                 Timer::after(Duration::from_millis(300)).await;
                 return;
             }
-            let slow = power == Power::MaxLow;
-            if applied != Some(slow) {
-                applied = Some(slow);
-                let (min, max) = if slow { (400, 500) } else { (15, 30) };
+            // `conn_ms` (`CS`), or a slow one in max-low power. A slow `conn_ms` waits until the
+            // link is set up: the central's service discovery and subscriptions take many round
+            // trips, which at 120 ms each delay the first answers by seconds.
+            let conn_ms = control::board().get(n::CONN_MS) as u64;
+            let settled = started.elapsed() >= SETTLE;
+            let min = if emotibit_ble::ota::ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+                15 // a firmware update: as fast as the central allows
+            } else if power == Power::MaxLow {
+                400
+            } else if settled {
+                conn_ms
+            } else {
+                conn_ms.min(30)
+            };
+            if applied != Some(min) {
+                applied = Some(min);
+                let max = if min >= 400 { min + 100 } else { min + 15 };
                 let params = RequestedConnParams {
                     min_connection_interval: Duration::from_millis(min),
                     max_connection_interval: Duration::from_millis(max),
@@ -521,6 +587,10 @@ async fn session(
             info!("disconnected: {:?}", reason);
         }
     }
+    // An update the host did not finish: drop it (the running firmware is untouched).
+    if emotibit_ble::ota::ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+        emotibit_ble::ota::IN.send(alloc::vec![b'A']).await;
+    }
 }
 
 /// Forward queued sensor records and event lines to the connected central. Records are batched
@@ -539,9 +609,11 @@ async fn stream<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<'_, '_
     let mut encoder = emotibit_ble::codec::Encoder::new();
     let mut resync = sensors::RESYNC.load(Relaxed);
     loop {
-        let (first_ts, first) = match select(sensors::QUEUE.receive(), control::EVENTS.receive()).await {
-            Either::First(p) => p,
-            Either::Second(line) => {
+        // Event lines first: they are a few a second, and on a slow connection interval the
+        // record queue is never empty, so checking it first would starve them (replies lost).
+        let (first_ts, first) = match select(control::EVENTS.receive(), sensors::QUEUE.receive()).await {
+            Either::Second(p) => p,
+            Either::First(line) => {
                 let mut payload: heapless::Vec<u8, 480> = heapless::Vec::new();
                 let _ = payload.extend_from_slice(line.as_bytes());
                 if !send(conn, || server.emotibit.events.notify(conn, &payload, false)).await {

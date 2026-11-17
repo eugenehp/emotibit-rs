@@ -42,10 +42,37 @@ cargo build --release                   # embed the new image in emotibit / emot
 
 The script sources `$ESP_EXPORT`, `~/export-esp.sh` or `~/export-esp195.sh`. Or from this
 directory: `cargo build --release`, then `espflash flash --chip esp32 --port PORT
-target/xtensa-esp32-none-elf/release/emotibit-ble`. `firmware/emotibit-ble.bin` is a merged
-image (bootloader at 0x1000, partition table at 0x8000, app at 0x10000), so
-`esptool.py write-flash 0 firmware/emotibit-ble.bin` also installs it, erasing the settings.
-`emotibit firmware ble` and `espflash flash` keep the settings sector (see [Settings](#settings)).
+target/xtensa-esp32-none-elf/release/emotibit-ble` (`espflash.toml` and the cargo runner name
+`partitions.csv`). `firmware/emotibit-ble.bin` is a merged image (bootloader at 0x1000,
+partition table at 0x8000, app at 0x10000), so `esptool.py write-flash 0 firmware/emotibit-ble.bin`
+also installs it, erasing the settings. `emotibit firmware ble` and `espflash flash` keep the
+settings sector (see [Settings](#settings)).
+
+### Updates over Bluetooth
+
+`emotibit --device EmotiBit-BLE-0001010 firmware ota` sends the app (the built-in image, or
+`--image FILE`) over Bluetooth; no USB. `partitions.csv` has two app slots, `ota_0` at 0x10000
+and `ota_1` at 0x200000 (1984 KB each), and `otadata`, which tells the bootloader which slot
+starts. The board writes the update into the slot it is not running. It then checks the
+SHA-256 of what is in flash against the host's, that the image is emotibit-ble, and the
+image's own hash, before it selects that slot and restarts (`src/ota.rs`). A failed or
+interrupted update leaves the running firmware as it was. At its first start the new firmware
+marks itself as working in `otadata`.
+
+Boards with the first release's image (one `factory` app, no `otadata`) need one install over
+USB (`emotibit firmware ble`) to get the slots; that install keeps their settings. An install
+over USB always starts the app it writes: it resets `otadata`.
+
+During an update the sensor stream pauses and the board asks for a 15 ms connection interval.
+The app goes compressed: each 4 KB sector on its own as raw deflate, so the board decompresses
+it straight into its sector buffer, with no 32 KB history (about 19 KB of heap during the
+update). That sends about 35% less (418 KB for the 644 KB app). Data goes without response,
+six writes at a time, the sixth with response (see `src/ota.rs`; trouble-host queues at most 8
+incoming writes and drops the rest). About 10 KB/s on macOS (it keeps a 30 ms interval), so
+about 45 s; erasing and writing the flash is 4 s of that, and the board logs both. The host
+falls back for older firmware: uncompressed for firmware without compression (about 65 s),
+and writes with response only before that (about 5 KB/s). Anyone in Bluetooth range can connect to the
+board and use this, as with every other command; there is no pairing.
 
 Opening the Feather's serial port resets it (DTR/RTS). The log is at 115200 baud; it never
 contains WiFi credentials, and the settings file is never logged.
@@ -79,7 +106,7 @@ SCK 5, MOSI 18, MISO 19, CS 4.
 
 ## Bluetooth protocol
 
-One service, `6e6f7469-6269-7400-0000-000000000001`, with four characteristics:
+One service, `6e6f7469-6269-7400-0000-000000000001`, with five characteristics:
 
 | UUID suffix | Name | Properties | Content |
 |---|---|---|---|
@@ -87,6 +114,7 @@ One service, `6e6f7469-6269-7400-0000-000000000001`, with four characteristics:
 | `…0003` | mode | read, write | wire format: 0 raw, 1 compact; every write restarts the encoder with key frames |
 | `…0004` | control | write | host commands: stock packet lines, up to 500 bytes |
 | `…0005` | events | notify | board status and replies: stock packet lines, up to 480 bytes |
+| `…0006` | update | write | firmware update: `B` size (u32) SHA-256, `D` offset (u32) bytes, `E` end, `A` abort; answers `OT,ready`/`progress`/`done`/`error` on events |
 
 The board advertises as `EmotiBit-BLE-<name>` (at most 22 bytes): the serial number, a
 configured name, or MAC bytes. Its static random address mixes the chip MAC, the GATT layout
@@ -131,8 +159,8 @@ as packet lines on the events characteristic.
 | `LM`, `TX` | as the Oscilloscope | LSL marker and cross-time lines in the file | |
 | `TL`, `AK` | host time; acked number, `RD` | answer to the board's `RD` | echoed, restamped |
 | `MN` `ML` `MM` `MO` `MH` | local time | power: normal, low, max-low, wireless off, hibernate | `EM` |
-| `CG` | | read settings | `CG,name,…,ppg_hz,…,leds,…,source,…,restart_needed,…,device_id,…` |
-| `CS` | `key,value,…` (`name`, `ppg_hz`, `leds`, `store`) | change settings | `CS,ok\|error,…`, `CG`, and `CW` if stored on the card |
+| `CG` | | read settings | `CG,name,…,leds,…,<each numeric setting>,…,cpu_mhz_next,…,profile,…,source,…,restart_needed,…,device_id,…` |
+| `CS` | `key,value,…` (settings below, `profile`, `store`) | change settings | `CS,ok\|error,…`, `CG`, and `CW` if stored on the card |
 | `CC` | `flash`, `sd` or `both` | forget stored settings | `CC`, `CW` |
 | `CR` | | restart (closes a recording first) | |
 | `ST` | | self-test | `ST,item,PASS\|FAIL\|ABSENT\|OFF,…` |
@@ -196,19 +224,48 @@ below) and `CONFIG.BAK` (its original, saved before the firmware first changed i
 
 ## Settings
 
-| Key | Values | Applies |
-|---|---|---|
-| `name` | up to 9 letters, digits, `-`, `_`; empty: the serial number | after a restart |
-| `ppg_hz` | 25 (stock), 100 (stock PPG-100: 800 sps averaged by 8, 118 µs) | at once |
-| `leds` | on / off | at once |
+| Key | Values | Default | Applies |
+|---|---|---|---|
+| `name` | up to 9 letters, digits, `-`, `_`; empty: the serial number | serial number | after a restart |
+| `leds` | on / off | on | at once |
+| `ppg_hz` | 25 (stock), 100 (stock PPG-100: 800 sps averaged by 8, 118 µs) | 25 | at once |
+| `led_brightness` | 1–31: NCP5623 PWM level (V4–V6), twice that in 0.125 mA steps on the KTD2026 (V7) | 8 (stock) | at once |
+| `cpu_mhz` | 80, 160, 240 | 240 | after a restart |
+| `sensor_ms` | 2–20: how often the sensor task wakes. EDA is read every 4 ms or the first wake after; the IMU, PPG and thermopile every 10 ms or the first wake after | 2 | at once |
+| `conn_ms` | 15–500: connection interval asked for (up to this + 15 ms; the central decides). A slower one starts 5 s into a connection, so the central's setup and short commands run at 30 ms | 15 | at once |
+| `adv_ms` | 20–10240: advertising interval while not connected | 160 | next advertising |
+| `tx_dbm` | −12, −9, −6, −3, 0, 3, 6, 9 | the controller's own (+9) | at once |
+| `ppg_led` | 1–255: MAX30101 LED current in 0.2 mA steps | 47 = 9.4 mA (stock) | at once |
+| `profile` | sets `leds` and every number above (below); keys after it override it | | |
+
+| Profile | LEDs | `ppg_hz` | `led_brightness` | `cpu_mhz` | `sensor_ms` | `conn_ms` | `adv_ms` | `tx_dbm` | `ppg_led` |
+|---|---|---|---|---|---|---|---|---|---|
+| `default` | on | 25 | 8 | 240 | 2 | 15 | 160 | radio's | 47 |
+| `high_frequency` | on | 100 | 8 | 240 | 2 | 15 | 160 | 3 | 47 |
+| `low_noise` | off | 25 | 8 | 160 | 2 | 30 | 160 | 3 | 79 |
+| `balanced` | on | 25 | 8 | 80 | 4 | 30 | 160 | 0 | 47 |
+| `energy_saving` | on | 25 | 4 | 80 | 10 | 60 | 318 | 0 | 47 |
+| `low_energy` | off | 25 | 1 | 80 | 20 | 120 | 418 | −6 | 31 |
+
+The table and the profiles live in `src/shared/tuning.rs`, which the host shares
+(`emotibit config profiles` prints them). Their power use has not been measured. The stock
+firmware runs at 80 MHz; at its own default the ESP32's Bluetooth controller transmits at its
+maximum, +9 dBm. `CG` reports the profile the settings match, or `custom`.
 
 Read at boot: the card's `CONFIG.TXT`, `EmotiBitBle` section, if present; otherwise the flash
-sector; otherwise defaults. `CG` reports which (`source`).
+sector; otherwise defaults. `CG` reports which (`source`). The CPU clock is set before the card
+can be read, so it always comes from flash: `CS` keeps it there whatever `store` says, and a
+different one in `CONFIG.TXT` is copied there at boot and applies from the next start
+(`restart_needed`). The transmit power is set through the controller's `ble_txpwr_set`, which
+esp-radio does not wrap on the ESP32 (`src/radio.rs`).
 
-- **Flash:** 4 KB at 0x9000 (the default partition table's `nvs`, unused by this firmware):
-  `EBCF`, version 1, name length, name (9 bytes), PPG Hz, LEDs, a one-byte sum. Written through
-  `esp-storage` with the second core parked for the write.
-- **Card:** `{"WifiCredentials": [...], "EmotiBitBle": {"name": "lab3", "ppg_hz": 100, "leds": false}}`.
+- **Flash:** 4 KB at 0x9000 (the first sector of `nvs` in `partitions.csv`, also there in the
+  first release's default table):
+  `EBCF`, version 2, name length, name (9 bytes), PPG Hz, LEDs, the other numbers as
+  little-endian `i16` (`i16::MIN`: not set), a one-byte sum. Version 1 records are still read.
+  Written through `esp-storage` with the second core parked for the write.
+- **Card:** `{"WifiCredentials": [...], "EmotiBitBle": {"name": "lab3", "profile": "balanced", "leds": false}}`
+  (any of the keys above; a key wins over the profile).
   The firmware replaces only the `EmotiBitBle` member (`stock::json_with_member`), copies the
   original to `CONFIG.BAK` once, refuses a file that is not a JSON object, and never logs it.
 

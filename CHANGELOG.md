@@ -1,3 +1,46 @@
+# 0.1.1 (2026-11-17)
+
+## emotibit-ble firmware
+
+- **Settings for battery life**, over Bluetooth (`CS`), in flash or `CONFIG.TXT`: LED brightness,
+  CPU clock (80/160/240 MHz), sensor wake interval, connection and advertising intervals,
+  transmit power, PPG LED current.
+- **Profiles** that set them together: `default`, `high_frequency`, `low_noise`, `balanced`,
+  `energy_saving`, `low_energy`; `CG` reports the matching one.
+- The settings record in flash is version 2; version 1 records are still read.
+- Fixed: on a slow connection interval, replies and status lines could be lost behind the
+  sensor records (they now go first). A slow interval starts 5 s into a connection, so the
+  central's setup and short commands run at 30 ms.
+- `emotibit config set … --restart` waits for the board to drop the link, so the restart is
+  not lost on a slow connection.
+- **Updates over Bluetooth** (`emotibit firmware ota`): a new partition table with two app slots
+  (`partitions.csv`); the board writes the update into the other slot, checks its SHA-256 and
+  image hash, and restarts into it; an interrupted update changes nothing. Boards with the
+  0.1.0 image need one install over USB for the slots (settings are kept). Data goes without
+  response, six writes per acknowledged window, and compressed per 4 KB sector (35% less): about
+  45 s for the app on macOS.
+- The record queue holds 256 records (was 96): `low_energy`'s 120 ms interval dropped a few.
+
+## Host
+
+- `emotibit config profiles`; `config` shows every setting and the profile; the web pages'
+  Settings panels have the profile and every setting.
+- `emotibit firmware ota`; `firmware ble` resets `otadata` (so the board starts the app it
+  wrote) and keeps emotibit-ble's settings across its partition table change; `firmware info`
+  shows which app slot starts.
+- `scripts/power-run.sh` retries a run whose stream did not start.
+- `--gzip`: recordings (the raw log and the per-signal CSVs) as `.csv.gz`, about a sixth of the
+  size; `parse` reads gzipped files, including a log cut short.
+
+## Packaging
+
+- Release binaries build with a `dist` profile (fat LTO, one codegen unit, stripped): about 40%
+  smaller. The web pages' wasm builds with `opt-level = "z"` and `wasm-opt -Oz`: 56% smaller.
+- `firmware/emotibit-ble.bin` is no longer padded to the 4 MB flash: 725 KB.
+- Release archives are `.tar.xz` (Windows: `.zip`): 2.4 MB, from 6.1 MB.
+- webbluetooth 0.0.5: on macOS a write without response could wait for ever, which stalled bulk
+  transfers such as firmware updates.
+
 # 0.1.0 (2026-11-11)
 
 The first release.

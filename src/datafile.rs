@@ -10,6 +10,10 @@
 //! * pass 2 writes `<base>_<TAG>.csv` for each tag. Sensor packets get one row per sample,
 //!   timestamps interpolated between packets; everything else gets one row per packet.
 //!
+//! Either can be gzipped (`.csv.gz`), about a sixth of the size: [`spawn_raw_logger`] compresses
+//! when the path ends in `.gz`, [`parse_file`] reads gzipped input and writes gzipped CSVs when
+//! asked. A gzipped log cut short (a crash, a power loss) still reads up to the cut.
+//!
 //! Only the local-time domain is produced. The DataParser can also emit LSL-clock columns when
 //! `LC`/`LM` cross-time packets are present; those are not converted here.
 
@@ -54,8 +58,11 @@ pub async fn spawn_raw_logger(handle: &EmotiBitHandle, path: PathBuf) -> Result<
     let file = tokio::fs::File::create(&path)
         .await
         .with_context(|| format!("cannot create {}", path.display()))?;
+    let gzip = path.extension().is_some_and(|e| e == "gz");
     Ok(tokio::spawn(async move {
         let mut out = tokio::io::BufWriter::new(file);
+        // Compressed in memory, written out as it fills.
+        let mut gz = gzip.then(|| flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default()));
         let mut lines = 0u64;
         let mut closed = false;
         loop {
@@ -74,13 +81,28 @@ pub async fn spawn_raw_logger(handle: &EmotiBitHandle, path: PathBuf) -> Result<
             };
             match next {
                 Ok(line) => {
-                    out.write_all(line.as_bytes()).await?;
-                    out.write_all(b"\n").await?;
+                    match gz.as_mut() {
+                        Some(gz) => {
+                            gz.write_all(line.as_bytes())?;
+                            gz.write_all(b"\n")?;
+                            if gz.get_ref().len() >= 64 * 1024 {
+                                out.write_all(gz.get_ref()).await?;
+                                gz.get_mut().clear();
+                            }
+                        }
+                        None => {
+                            out.write_all(line.as_bytes()).await?;
+                            out.write_all(b"\n").await?;
+                        }
+                    }
                     lines += 1;
                 }
                 Err(RecvError::Lagged(n)) => warn!("raw logger fell behind, {n} packets not recorded"),
                 Err(RecvError::Closed) => break,
             }
+        }
+        if let Some(gz) = gz {
+            out.write_all(&gz.finish()?).await?;
         }
         out.flush().await?;
         Ok(lines)
@@ -105,17 +127,28 @@ pub struct ParseReport {
 const COMMON_HEADERS: &str = "EmotiBitTimestamp,PacketNumber,DataLength,TypeTag,ProtocolVersion,DataReliability";
 
 struct TagOut {
-    w: BufWriter<File>,
+    w: BufWriter<Box<dyn Write>>,
     prev_ts: Option<u32>,
 }
 
+/// A file's name without `.gz` and `.csv`: the base of the per-signal names.
+fn base_name(input: &Path) -> Option<String> {
+    let name = input.file_name()?.to_str()?;
+    let name = name.strip_suffix(".gz").unwrap_or(name);
+    Some(Path::new(name).file_stem()?.to_str()?.to_string())
+}
+
+/// A CSV to write, gzipped (`.csv.gz`) or not.
+fn create_csv(dir: &Path, name: &str, gzip: bool) -> Result<(PathBuf, BufWriter<Box<dyn Write>>)> {
+    let path = dir.join(if gzip { format!("{name}.csv.gz") } else { format!("{name}.csv") });
+    let file = File::create(&path).with_context(|| format!("cannot create {}", path.display()))?;
+    let w: Box<dyn Write> = if gzip { Box::new(flate2::write::GzEncoder::new(file, flate2::Compression::default())) } else { Box::new(file) };
+    Ok((path, BufWriter::new(w)))
+}
+
 /// Convert a raw file into per-tag CSVs next to it (or in `out_dir`).
-pub fn parse_file(input: &Path, out_dir: Option<&Path>) -> Result<ParseReport> {
-    let base = input
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .context("input has no file name")?
-        .to_string();
+pub fn parse_file(input: &Path, out_dir: Option<&Path>, gzip: bool) -> Result<ParseReport> {
+    let base = base_name(input).context("input has no file name")?;
     let dir = match out_dir {
         Some(d) => d.to_path_buf(),
         None => input.parent().map(Path::to_path_buf).unwrap_or_default(),
@@ -126,7 +159,15 @@ pub fn parse_file(input: &Path, out_dir: Option<&Path>) -> Result<ParseReport> {
     let mut report = ParseReport::default();
     let mut packets: Vec<Packet> = Vec::new();
     let mut sync = TimeSync::new();
-    let bytes = std::fs::read(input).with_context(|| format!("cannot open {}", input.display()))?;
+    let mut bytes = std::fs::read(input).with_context(|| format!("cannot open {}", input.display()))?;
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut plain = Vec::new();
+        // A log cut short ends without the gzip trailer: keep what came before the cut.
+        if let Err(e) = std::io::Read::read_to_end(&mut flate2::read::MultiGzDecoder::new(&bytes[..]), &mut plain) {
+            warn!("{}: {e}; using the {} bytes before it", input.display(), plain.len());
+        }
+        bytes = plain;
+    }
     // A binary file from the BLE firmware's SD card (`.EBB`) becomes the same stock lines.
     let lines: Vec<String> = match crate::ble::binary_to_lines(&bytes) {
         Some(lines) => lines,
@@ -163,8 +204,7 @@ pub fn parse_file(input: &Path, out_dir: Option<&Path>) -> Result<ParseReport> {
         let out = match outs.get_mut(&p.tag) {
             Some(o) => o,
             None => {
-                let path = dir.join(format!("{base}_{}.csv", p.tag));
-                let mut w = BufWriter::new(File::create(&path)?);
+                let (path, mut w) = create_csv(&dir, &format!("{base}_{}", p.tag), gzip)?;
                 writeln!(w, "LocalTimestamp,{COMMON_HEADERS},{}", p.tag)?;
                 report.files.push(path);
                 outs.entry(p.tag.clone()).or_insert(TagOut { w, prev_ts: None })
@@ -195,30 +235,29 @@ pub fn parse_file(input: &Path, out_dir: Option<&Path>) -> Result<ParseReport> {
             *rows += 1;
         }
     }
-    for o in outs.values_mut() {
-        o.w.flush()?;
+    // Each writer finishes its gzip stream when dropped, after the flush.
+    for (_, o) in std::mem::take(&mut outs) {
+        o.w.into_inner().map_err(|e| e.into_error())?.flush()?;
     }
 
     // Time-sync map and the individual exchanges.
-    let map_path = dir.join(format!("{base}_timeSyncMap.csv"));
-    write_sync_map(&map_path, &anchors, &sync, &packets)?;
+    let (map_path, w) = create_csv(&dir, &format!("{base}_timeSyncMap"), gzip)?;
+    write_sync_map(w, &anchors, &sync, &packets)?;
     report.files.push(map_path);
-    let sync_path = dir.join(format!("{base}_timeSyncs.csv"));
-    let mut w = BufWriter::new(File::create(&sync_path)?);
+    let (sync_path, mut w) = create_csv(&dir, &format!("{base}_timeSyncs"), gzip)?;
     writeln!(w, "RD,TS_received,TS_sent,AK,RoundTrip")?;
     for p in sync.points() {
         writeln!(w, "{},{},{:.6},{},{}", p.rd, p.received, p.sent_local, p.ack, p.round_trip)?;
     }
-    w.flush()?;
+    w.into_inner().map_err(|e| e.into_error())?.flush()?;
     report.files.push(sync_path);
     Ok(report)
 }
 
-fn write_sync_map(path: &Path, a: &Anchors, sync: &TimeSync, packets: &[Packet]) -> Result<()> {
+fn write_sync_map(mut w: BufWriter<Box<dyn Write>>, a: &Anchors, sync: &TimeSync, packets: &[Packet]) -> Result<()> {
     let (lo, hi) = packets
         .iter()
         .fold((u32::MAX, 0u32), |(lo, hi), p| (lo.min(p.timestamp), hi.max(p.timestamp)));
-    let mut w = BufWriter::new(File::create(path)?);
     writeln!(w, "TE0,TE1,TL0,TL1,TimeSyncsReceived,EmotiBitStartTime,EmotiBitEndTime,DataParserVersion")?;
     writeln!(
         w,
@@ -230,7 +269,7 @@ fn write_sync_map(path: &Path, a: &Anchors, sync: &TimeSync, packets: &[Packet])
         sync.points().len(),
         env!("CARGO_PKG_VERSION")
     )?;
-    w.flush()?;
+    w.into_inner().map_err(|e| e.into_error())?.flush()?;
     Ok(())
 }
 
@@ -244,6 +283,38 @@ mod tests {
         let b = parse_local_timestamp("2026-11-05_17-54-49-000000").unwrap();
         assert!((a - b - 0.5).abs() < 1e-9);
         assert!(parse_local_timestamp("garbage").is_none());
+    }
+
+    /// A gzipped log, whole or cut short, parses to the same CSVs as the plain one; `gzip`
+    /// writes them as `.csv.gz`.
+    #[test]
+    fn gzipped_logs_and_csvs() {
+        use std::io::Read;
+        let dir = std::env::temp_dir().join(format!("emotibit-gzip-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut raw = String::new();
+        for i in 0..2000u32 {
+            raw += &format!("{},{},1,AX,1,100,{}.5\n", 1000 + i * 10, i, i % 7);
+        }
+        std::fs::write(dir.join("plain.csv"), &raw).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(raw.as_bytes()).unwrap();
+        let gz = gz.finish().unwrap();
+        assert!(gz.len() * 4 < raw.len());
+        std::fs::write(dir.join("zipped.csv.gz"), &gz).unwrap();
+        std::fs::write(dir.join("cut.csv.gz"), &gz[..gz.len() / 2]).unwrap();
+
+        parse_file(&dir.join("plain.csv"), None, false).unwrap();
+        let r = parse_file(&dir.join("zipped.csv.gz"), None, true).unwrap();
+        assert_eq!(r.rows["AX"], 2000);
+        let mut unzipped = String::new();
+        flate2::read::GzDecoder::new(File::open(dir.join("zipped_AX.csv.gz")).unwrap()).read_to_string(&mut unzipped).unwrap();
+        assert_eq!(unzipped, std::fs::read_to_string(dir.join("plain_AX.csv")).unwrap());
+        assert!(dir.join("zipped_timeSyncMap.csv.gz").exists());
+
+        let cut = parse_file(&dir.join("cut.csv.gz"), None, false).unwrap();
+        assert!(cut.rows["AX"] > 100 && cut.rows["AX"] < 2000, "kept {}", cut.rows["AX"]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -269,7 +340,7 @@ mod tests {
         raw += "4200,12,4,EM,1,100,RS,RE,PS,MN\n";
         std::fs::write(&input, raw).unwrap();
 
-        let report = parse_file(&input, None).unwrap();
+        let report = parse_file(&input, None, false).unwrap();
         assert_eq!(report.malformed, 1);
         assert_eq!(report.sync_points, 2);
         assert!(report.anchored);

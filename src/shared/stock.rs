@@ -399,8 +399,9 @@ fn member_span(text: &str, key: &str) -> Option<(usize, usize)> {
     Some((quote_start, end))
 }
 
-/// The `EmotiBitBle` section for `CONFIG.TXT`.
-pub fn write_settings_section<W: core::fmt::Write>(w: &mut W, name: Option<&str>, ppg_hz: Option<u8>, leds: Option<bool>) -> core::fmt::Result {
+/// The `EmotiBitBle` section for `CONFIG.TXT`: the name, the LEDs, and numeric settings by key
+/// (absent ones left out).
+pub fn write_settings_section<W: core::fmt::Write>(w: &mut W, name: Option<&str>, leds: Option<bool>, numbers: &[(&str, Option<i16>)]) -> core::fmt::Result {
     w.write_char('{')?;
     let mut first = true;
     let mut sep = |w: &mut W| -> core::fmt::Result {
@@ -413,13 +414,15 @@ pub fn write_settings_section<W: core::fmt::Write>(w: &mut W, name: Option<&str>
         sep(w)?;
         write!(w, "\"name\": \"{n}\"")?;
     }
-    if let Some(hz) = ppg_hz {
-        sep(w)?;
-        write!(w, "\"ppg_hz\": {hz}")?;
-    }
     if let Some(l) = leds {
         sep(w)?;
         write!(w, "\"leds\": {l}")?;
+    }
+    for (key, value) in numbers {
+        if let Some(v) = value {
+            sep(w)?;
+            write!(w, "\"{key}\": {v}")?;
+        }
     }
     w.write_char('}')
 }
@@ -484,8 +487,11 @@ mod tests {
     #[test]
     fn settings_merge_keeps_the_rest_of_config_txt() {
         let stock = "{\n  \"WifiCredentials\": [{\"ssid\": \"a,b}\", \"password\": \"p{\"}]\n}\n";
-        let mut sec = Fixed::<64>::new();
-        write_settings_section(&mut sec, Some("lab3"), Some(100), Some(false)).unwrap();
+        let mut sec = Fixed::<320>::new();
+        // Every key at its longest: what the firmware's buffer must hold.
+        let numbers = [("ppg_hz", Some(100)), ("led_brightness", Some(31)), ("cpu_mhz", Some(240)), ("sensor_ms", Some(20)), ("conn_ms", Some(500)), ("adv_ms", Some(10240)), ("tx_dbm", Some(-12)), ("ppg_led", Some(255))];
+        write_settings_section(&mut sec, Some("lab3-long"), Some(false), &numbers).unwrap();
+        assert!(sec.as_str().len() <= 256, "{}", sec.as_str());
         // Insert.
         let mut once = Fixed::<512>::new();
         json_with_member(stock, "EmotiBitBle", Some(sec.as_str()), &mut once).unwrap();
@@ -493,9 +499,11 @@ mod tests {
         assert_eq!(v["WifiCredentials"][0]["ssid"], "a,b}");
         assert_eq!(v["WifiCredentials"][0]["password"], "p{");
         assert_eq!(v["EmotiBitBle"]["ppg_hz"], 100);
+        assert_eq!(v["EmotiBitBle"]["leds"], false);
+        assert_eq!((v["EmotiBitBle"]["led_brightness"].as_u64(), v["EmotiBitBle"]["cpu_mhz"].as_u64(), v["EmotiBitBle"]["sensor_ms"].as_u64()), (Some(31), Some(240), Some(20)));
         // Replace: the credentials text is untouched byte for byte.
         let mut sec2 = Fixed::<64>::new();
-        write_settings_section(&mut sec2, None, Some(25), None).unwrap();
+        write_settings_section(&mut sec2, None, None, &[("ppg_hz", Some(25)), ("cpu_mhz", None)]).unwrap();
         let mut twice = Fixed::<512>::new();
         json_with_member(once.as_str(), "EmotiBitBle", Some(sec2.as_str()), &mut twice).unwrap();
         let v: serde_json::Value = serde_json::from_str(twice.as_str()).unwrap();
@@ -507,9 +515,9 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(gone.as_str()).unwrap();
         assert!(v.get("EmotiBitBle").is_none() && v["WifiCredentials"][0]["ssid"] == "a,b}");
         // A new file, and one that is not an object.
-        let mut new = Fixed::<128>::new();
+        let mut new = Fixed::<384>::new();
         json_with_member("", "EmotiBitBle", Some(sec.as_str()), &mut new).unwrap();
-        assert_eq!(serde_json::from_str::<serde_json::Value>(new.as_str()).unwrap()["EmotiBitBle"]["name"], "lab3");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(new.as_str()).unwrap()["EmotiBitBle"]["name"], "lab3-long");
         assert!(json_with_member("[1]", "EmotiBitBle", Some("{}"), &mut Fixed::<16>::new()).is_err());
     }
 

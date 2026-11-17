@@ -14,7 +14,7 @@ dist="$here/dist"
 py=$(command -v python3 || command -v python)
 
 cargo build --manifest-path "$root/Cargo.toml" --example web \
-  --target wasm32-unknown-unknown --release --no-default-features --features ble
+  --target wasm32-unknown-unknown --profile web --no-default-features --features ble
 
 shim=$(
   cargo metadata --manifest-path "$root/Cargo.toml" --format-version 1 \
@@ -26,7 +26,15 @@ print(os.path.join(os.path.dirname(backend["manifest_path"]), "js", "webbluetoot
 )
 
 mkdir -p "$dist"
-cp "$root/target/wasm32-unknown-unknown/release/examples/web.wasm" "$dist/web.wasm"
+wasm="$root/target/wasm32-unknown-unknown/web/examples/web.wasm"
+# wasm-opt (binaryen) shrinks it by a third again; the page works without it.
+if command -v wasm-opt >/dev/null; then
+  wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext \
+    --enable-mutable-globals --strip-debug --strip-producers "$wasm" -o "$dist/web.wasm"
+else
+  echo "wasm-opt not found (binaryen): web.wasm is not as small as it could be" >&2
+  cp "$wasm" "$dist/web.wasm"
+fi
 cp "$shim" "$dist/webbluetooth.js"
 cp "$here/index.html" "$here/app.js" "$here/render.js" "$dist/"
 
